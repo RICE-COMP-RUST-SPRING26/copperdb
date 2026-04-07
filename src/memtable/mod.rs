@@ -50,7 +50,7 @@ pub type QueryResult = Option<(Record, u64)>;
 /// The interface for our concurrent in-memory write buffer.
 /// Requires Send + Sync so it can be safely shared across Tokio threads.
 pub trait MemTable: Send + Sync {
-    fn new() -> Self;
+    fn new(id: u64) -> Self;
     /// Inserts a new record or tombstone.
     /// Uses a sequence number to handle versioning and conflict resolution.
     fn put(&self, key: String, record: Record, seq_num: u64);
@@ -67,6 +67,8 @@ pub trait MemTable: Send + Sync {
     /// Returns a bounded iterator for the K-way merge process.
     /// `KvIterator` is the universal reader trait we defined previously.
     fn get_iterator(&self, low: Bound<String>, high: Bound<String>) -> Box<dyn KvIterator>;
+
+    fn id(&self) -> u64;
 }
 
 pub struct CrossbeamMemTable {
@@ -75,10 +77,11 @@ pub struct CrossbeamMemTable {
     map: Arc<SkipMap<InternalKey, Record>>,
     approximate_size: AtomicUsize,
     active_writers: AtomicUsize,
+    id: u64
 }
 
 impl MemTable for CrossbeamMemTable {
-    fn new() -> Self {
+    fn new(id: u64) -> Self {
         Self {
             map: Arc::new(SkipMap::new()),
             approximate_size: AtomicUsize::new(0), // Used to determine whether to mark table as inactive
@@ -87,7 +90,12 @@ impl MemTable for CrossbeamMemTable {
              // Potentially use a spin_loop() while waiting for active_writers
              // to drop to 0
             active_writers: AtomicUsize::new(0),
+            id
         }
+    }
+
+    fn id(&self) -> u64 {
+        self.id
     }
 
     fn put(&self, user_key: String, record: Record, seq_num: u64) {
@@ -248,7 +256,7 @@ mod tests {
 
     #[test]
     fn test_basic_put_and_get() {
-        let memtable = CrossbeamMemTable::new();
+        let memtable = CrossbeamMemTable::new(0);
         memtable.put("apple".to_string(), Record::Put(b("red")), 1);
 
         let result = memtable.get("apple").unwrap();
@@ -258,13 +266,13 @@ mod tests {
 
     #[test]
     fn test_get_nonexistent_key() {
-        let memtable = CrossbeamMemTable::new();
+        let memtable = CrossbeamMemTable::new(0);
         assert!(memtable.get("banana").is_none());
     }
 
     #[test]
     fn test_mvcc_update_returns_newest_version() {
-        let memtable = CrossbeamMemTable::new();
+        let memtable = CrossbeamMemTable::new(0);
         // Insert older version first
         memtable.put("apple".to_string(), Record::Put(b("green")), 5);
         // Insert newer version later
@@ -278,7 +286,7 @@ mod tests {
 
     #[test]
     fn test_delete_acts_as_tombstone() {
-        let memtable = CrossbeamMemTable::new();
+        let memtable = CrossbeamMemTable::new(0);
         memtable.put("apple".to_string(), Record::Put(b("red")), 5);
         // Delete the key at a higher sequence number
         memtable.put("apple".to_string(), Record::Delete, 10);
@@ -290,7 +298,7 @@ mod tests {
 
     #[test]
     fn test_iterator_range_bounds() {
-        let memtable = CrossbeamMemTable::new();
+        let memtable = CrossbeamMemTable::new(0);
         memtable.put("apple".to_string(), Record::Put(b("1")), 1);
         memtable.put("banana".to_string(), Record::Put(b("2")), 2);
         memtable.put("cherry".to_string(), Record::Put(b("3")), 3);
@@ -312,7 +320,7 @@ mod tests {
 
     #[test]
     fn test_iterator_yields_all_versions_descending() {
-        let memtable = CrossbeamMemTable::new();
+        let memtable = CrossbeamMemTable::new(0);
         // Insert completely out of order to ensure our Ord trait does the heavy lifting
         memtable.put("apple".to_string(), Record::Put(b("v1")), 10);
         memtable.put("apple".to_string(), Record::Put(b("v3")), 30);
@@ -329,7 +337,7 @@ mod tests {
 
     #[test]
     fn test_approximate_size_tracking() {
-        let memtable = CrossbeamMemTable::new();
+        let memtable = CrossbeamMemTable::new(0);
         assert_eq!(memtable.approximate_size(), 0);
 
         // "cat" (3) + "dog" (3) + seq_num (8) = 14 bytes
@@ -347,7 +355,7 @@ mod tests {
 
     #[test]
     fn test_concurrent_puts_unique_keys() {
-        let memtable = Arc::new(CrossbeamMemTable::new());
+        let memtable = Arc::new(CrossbeamMemTable::new(0));
         let mut handles = vec![];
 
         // 10 threads, each writing 100 unique keys
@@ -377,7 +385,7 @@ mod tests {
 
     #[test]
     fn test_concurrent_updates_same_key() {
-        let memtable = Arc::new(CrossbeamMemTable::new());
+        let memtable = Arc::new(CrossbeamMemTable::new(0));
         let mut handles = vec![];
 
         // 10 threads all hammering the exact same key with different sequence numbers
@@ -401,7 +409,7 @@ mod tests {
 
     #[test]
     fn test_concurrent_reads_while_writing() {
-        let memtable = Arc::new(CrossbeamMemTable::new());
+        let memtable = Arc::new(CrossbeamMemTable::new(0));
         let mt_writer = Arc::clone(&memtable);
         
         // Writer thread constantly adding new versions of "hot_key"
@@ -432,7 +440,7 @@ mod tests {
 
     #[test]
     fn test_concurrent_size_tracking_is_atomic() {
-        let memtable = Arc::new(CrossbeamMemTable::new());
+        let memtable = Arc::new(CrossbeamMemTable::new(0));
         let mut handles = vec![];
 
         // 5 threads writing identical sized data
@@ -457,7 +465,7 @@ mod tests {
 
     #[test]
     fn test_concurrent_write_during_iteration() {
-        let memtable = Arc::new(CrossbeamMemTable::new());
+        let memtable = Arc::new(CrossbeamMemTable::new(0));
 
         // 1. Pre-populate with some "even" keys
         for i in (0..100).step_by(2) {
@@ -533,7 +541,7 @@ mod tests {
 
     #[test]
     fn test_active_writers_returns_to_zero_after_heavy_contention() {
-        let table = Arc::new(CrossbeamMemTable::new());
+        let table = Arc::new(CrossbeamMemTable::new(0));
         let mut handles = vec![];
         
         // Use a barrier to force all 10 threads to start at the exact same time,
@@ -570,7 +578,7 @@ mod tests {
 
     #[test]
     fn test_flusher_spin_loop_waits_for_in_flight_writers() {
-        let table = Arc::new(CrossbeamMemTable::new());
+        let table = Arc::new(CrossbeamMemTable::new(0));
         let table_for_writer = Arc::clone(&table);
         
         // This flag simulates the MemTableState freezing the active table.
