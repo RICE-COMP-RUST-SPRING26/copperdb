@@ -1,4 +1,4 @@
-use crate::sstable::{block::BlockError};
+use crate::sstable::{block::BlockError, writer::WriterError};
 
 pub mod block;
 pub mod reader;
@@ -8,4 +8,7 @@ pub mod writer;
 pub enum SSTableError {
     #[error("SSTable block error: {0}")]
     Block(#[from] BlockError),
+
+    #[error("SSTable writer error: {0}")]
+    Writer(#[from] WriterError),
 }
