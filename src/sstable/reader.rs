@@ -83,73 +83,84 @@ impl SsTableReader {
 
     /// Searches for a specific user key in the SSTable.
     /// Returns Ok(None) if the key does not exist in this file.
-    pub fn search(
-        &mut self,
-        target_key: &str,
-    ) -> Result<Option<(InternalKey, Record)>, ReaderError> {
+    pub fn search(&mut self, target_key: &str) -> Result<Option<(InternalKey, Record)>, ReaderError> {
         let num_offsets = self.index_block.get_num_offsets()?;
 
         if num_offsets == 0 {
             return Ok(None);
         }
 
-        let mut target_block_offset = None;
-        let mut next_block_offset = self.index_offset;
+        let mut last_less_than = None;
+        let mut first_equal = None;
 
+        // 1. Scan the index to find the candidate blocks
         for i in 0..num_offsets {
             let entry_offset = self.index_block.get_offset(i, num_offsets)?;
             let (key, record) = self.index_block.decode_entry(entry_offset)?;
-
-            // Safely convert the dynamic Vec<u8> into a fixed 8-byte array
+            
             let block_start = match record {
-                Record::Put(val) => u64::from_be_bytes(val.try_into().map_err(|_| {
-                    ReaderError::CorruptData("Index block pointer is not 8 bytes".to_string())
-                })?),
-                Record::Delete => {
-                    return Err(ReaderError::CorruptData(
-                        "Index block contains Delete record".to_string(),
-                    ));
-                }
+                Record::Put(val) => u64::from_be_bytes(
+                    val.try_into()
+                       .map_err(|_| ReaderError::CorruptData("Index block pointer is not 8 bytes".to_string()))?
+                ),
+                Record::Delete => return Err(ReaderError::CorruptData("Index block contains Delete record".to_string())),
             };
 
-            if key.user_key.as_str() <= target_key {
-                target_block_offset = Some(block_start);
-
-                if i + 1 < num_offsets {
-                    let next_entry_offset = self.index_block.get_offset(i + 1, num_offsets)?;
-                    let (_, next_record) = self.index_block.decode_entry(next_entry_offset)?;
-
-                    next_block_offset = match next_record {
-                        Record::Put(val) => u64::from_be_bytes(val.try_into().map_err(|_| {
-                            ReaderError::CorruptData(
-                                "Next index block pointer is not 8 bytes".to_string(),
-                            )
-                        })?),
-                        Record::Delete => {
-                            return Err(ReaderError::CorruptData(
-                                "Next index block contains Delete record".to_string(),
-                            ));
-                        }
-                    };
-                } else {
-                    next_block_offset = self.index_offset;
+            let next_block_offset = if i + 1 < num_offsets {
+                let next_entry_offset = self.index_block.get_offset(i + 1, num_offsets)?;
+                let (_, next_record) = self.index_block.decode_entry(next_entry_offset)?;
+                
+                match next_record {
+                    Record::Put(val) => u64::from_be_bytes(
+                        val.try_into()
+                           .map_err(|_| ReaderError::CorruptData("Next index pointer is not 8 bytes".to_string()))?
+                    ),
+                    Record::Delete => return Err(ReaderError::CorruptData("Next index contains Delete".to_string())),
                 }
             } else {
+                self.index_offset
+            };
+
+            // Route to the correct candidate blocks
+            if key.user_key.as_str() < target_key {
+                last_less_than = Some((block_start, next_block_offset));
+            } else if key.user_key.as_str() == target_key {
+                if first_equal.is_none() {
+                    first_equal = Some((block_start, next_block_offset));
+                }
+                // Once we find the first block starting with the target, we don't need to look 
+                // further. Subsequent blocks will only contain older versions.
+                break;
+            } else {
+                // key.user_key > target_key
                 break;
             }
         }
 
-        // 2. Read the specific Data Block from disk and search it
-        if let Some(start_offset) = target_block_offset {
-            let block_size = next_block_offset - start_offset;
+        // Gather our candidates (at most 2 blocks)
+        let mut candidate_blocks = Vec::new();
+        if let Some(block) = last_less_than {
+            candidate_blocks.push(block);
+        }
+        if let Some(block) = first_equal {
+            candidate_blocks.push(block);
+        }
 
+        // 2. Read the candidate blocks from disk and search them in order
+        for (start_offset, next_offset) in candidate_blocks {
+            let block_size = next_offset - start_offset;
+            
             self.file.seek(SeekFrom::Start(start_offset))?;
             let mut block_data = vec![0u8; block_size as usize];
             self.file.read_exact(&mut block_data)?;
-
+            
             let data_block = Block::decode(block_data);
-
-            return Ok(data_block.search(target_key)?);
+            
+            // If we find the key in the first candidate (which contains the highest seq numbers),
+            // we return it immediately and skip reading the second block.
+            if let Some(result) = data_block.search(target_key)? {
+                return Ok(Some(result));
+            }
         }
 
         Ok(None)
@@ -385,5 +396,49 @@ mod tests {
             res_after.is_none(),
             "Should return None for key larger than last entry"
         );
+    }
+
+    #[test]
+    fn test_reader_search_multiple_versions_across_blocks() {
+        let file = TempFileGuard::new("read_mvcc_multi_block.sst");
+        
+        let mut entries = Vec::new();
+        
+        // We use a 2000-byte padding so that each "banana" takes up ~half a block.
+        // This guarantees that the 3 versions of banana span across at least 2 block boundaries.
+        let pad = vec![0u8; 2000]; 
+        
+        entries.push(("apple".to_string(), Record::Put(b("red")), 1));
+        
+        // NEWEST version: Should end up in the same block as "apple" or start its own
+        entries.push(("banana".to_string(), Record::Put(pad.clone()), 3)); 
+        
+        // MIDDLE version: Will overflow into a new block
+        entries.push(("banana".to_string(), Record::Put(pad.clone()), 2));
+        
+        // OLDEST version: Will overflow into yet another block
+        entries.push(("banana".to_string(), Record::Put(pad.clone()), 1)); 
+        
+        entries.push(("cherry".to_string(), Record::Put(b("red")), 1));
+        
+        build_test_sst(file.path_str(), entries);
+
+        let mut reader = SsTableReader::open(file.path_str()).unwrap();
+
+        // When we search for "banana", the reader must correctly identify the block
+        // containing sequence number 3 and return it, ignoring 2 and 1.
+        let (k, r) = reader.search("banana").unwrap().expect("banana should exist");
+        
+        assert_eq!(k.user_key, "banana");
+        assert_eq!(
+            k.seq_num, 3, 
+            "Failed to retrieve the newest version! Reader index routing might be flawed."
+        );
+        
+        if let Record::Put(val) = r {
+            assert_eq!(val.len(), 2000);
+        } else {
+            panic!("Expected Put record");
+        }
     }
 }
