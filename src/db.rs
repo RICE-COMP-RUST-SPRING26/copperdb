@@ -37,17 +37,20 @@ impl LsmEngine {
         let next_gen = highest_wal_gen(dir) + 1;
         let max_seq = records.iter().map(|r| r.seq_num).max().unwrap_or(0);
 
-        let state = MemTableState::new(MAX_IMMUTABLE_TABLES, MAX_MEMTABLE_SIZE);
+        // Explicitly tie the starting MemTable to the starting WAL generation
+        let state = MemTableState::new(MAX_IMMUTABLE_TABLES, MAX_MEMTABLE_SIZE, next_gen);
 
         for r in records {
             let record = match r.op {
                 WalOpType::Put => Record::Put(r.value),
                 WalOpType::Delete => Record::Delete,
             };
-            // Ignore the freeze signal during replay — no new WAL writes happen here.
+            // Ignore capacity limits during replay. All old WALs get merged 
+            // into this single starting MemTable.
             state.put(r.key, record, r.seq_num);
         }
 
+        // Create the active WAL file for new user writes
         let active_wal = Wal::<Crc32Checksum>::create(dir, next_gen)?;
 
         Ok(Self {
@@ -73,8 +76,9 @@ impl LsmEngine {
             wal.append_put(seq, &key, &value)?;
         }
 
-        if self.state.put(key, Record::Put(value), seq) {
-            self.rotate_wal()?;
+        // put() returns the ID of the table if it needs freezing
+        if let Some(expected_id) = self.state.put(key, Record::Put(value), seq) {
+            self.rotate_wal_and_memtable(expected_id)?;
         }
 
         Ok(())
@@ -97,21 +101,37 @@ impl LsmEngine {
             wal.append_delete(seq, &key)?;
         }
 
-        if self.state.put(key, Record::Delete, seq) {
-            self.rotate_wal()?;
+        if let Some(expected_id) = self.state.put(key, Record::Delete, seq) {
+            self.rotate_wal_and_memtable(expected_id)?;
         }
 
         Ok(())
     }
 
-    /// Pair a new WAL file with the new active MemTable after a freeze.
-    ///
-    /// The old WAL file stays on disk until its paired immutable MemTable has
-    /// been flushed to an SSTable (Phase 2 work).
-    fn rotate_wal(&self) -> io::Result<()> {
-        let wal_gen = self.next_wal_gen.fetch_add(1, Ordering::SeqCst);
-        let new_wal = Wal::<Crc32Checksum>::create(&self.data_dir, wal_gen)?;
-        *self.active_wal.lock().unwrap() = new_wal;
+    /// Safely coordinates rotating BOTH the WAL file and the MemTable together.
+    /// Expects the ID of the MemTable that triggered the rotation request.
+    fn rotate_wal_and_memtable(&self, expected_id: u64) -> io::Result<()> {
+        // 1. Lock the WAL. This acts as our synchronization barrier.
+        let mut wal_guard = self.active_wal.lock().unwrap();
+        
+        // 2. Identity-Based Double-Checked Locking!
+        // If the active table's ID no longer matches the ID of the table we 
+        // filled up, it means another thread already rotated it. Abort safely!
+        if self.state.active_id() != expected_id {
+            return Ok(());
+        }
+
+        let new_wal_gen = self.next_wal_gen.fetch_add(1, Ordering::SeqCst);
+        
+        // 3. Create the new WAL file
+        let new_wal = Wal::<Crc32Checksum>::create(&self.data_dir, new_wal_gen)?;
+        
+        // 4. Freeze the MemTable and assign it the EXACT SAME ID
+        self.state.freeze_active(new_wal_gen);
+        
+        // 5. Swap the active WAL
+        *wal_guard = new_wal;
+        
         Ok(())
     }
 }
