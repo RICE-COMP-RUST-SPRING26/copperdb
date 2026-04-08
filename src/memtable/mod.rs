@@ -2,7 +2,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use crossbeam_skiplist::SkipMap;
 use std::ops::Bound;
-use std::cmp;
 
 use crate::core::{InternalKey, Record, KvIterator};
 

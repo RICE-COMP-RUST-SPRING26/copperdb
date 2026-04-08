@@ -1,4 +1,3 @@
-use std::fmt;
 use std::mem::size_of;
 
 use crate::core::{CoreError, InternalKey, Record, RecordTag};
@@ -19,22 +18,14 @@ const RECORD_TYPE_SIZE: usize = size_of::<RecordTag>();
 
 // --- Error Handling ---
 
-#[derive(Debug)]
+#[derive(thiserror::Error, Debug)]
 pub enum BlockError {
+    #[error("Corrupt block data: {0}")]
     CorruptData(String),
+
+    #[error("Invalid UTF-8 in key: {0}")]
     InvalidUtf8(std::str::Utf8Error),
 }
-
-impl fmt::Display for BlockError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            BlockError::CorruptData(msg) => write!(f, "Corrupt block data: {}", msg),
-            BlockError::InvalidUtf8(err) => write!(f, "Invalid UTF-8 in key: {}", err),
-        }
-    }
-}
-
-impl std::error::Error for BlockError {}
 
 impl From<std::str::Utf8Error> for BlockError {
     fn from(err: std::str::Utf8Error) -> Self {

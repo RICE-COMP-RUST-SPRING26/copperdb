@@ -1,6 +1,8 @@
 use std::cmp;
 
+#[derive(thiserror::Error, Debug)]
 pub enum CoreError {
+    #[error("Corrupt data: {0}")]
     CorruptData(String)
 }
 
