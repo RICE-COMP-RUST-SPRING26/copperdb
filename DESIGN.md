@@ -1,0 +1,382 @@
+# LSM-Tree Storage Engine — Design Reference
+
+A persistent Key-Value storage engine in **Rust** using a Log-Structured Merge-tree (LSM-tree) architecture. Optimized for high write throughput by buffering writes in memory and flushing sequentially to disk.
+
+---
+
+## Critical Paths
+
+### Write Path (`put`, `delete`)
+
+1. **API Receipt:** Tokio server receives the payload.
+2. **WAL Append:** Operation is sequentially appended to the active Write-Ahead Log.
+3. **MemTable Insertion:** Inserted into the concurrent SkipList MemTable. A `delete` writes a "tombstone" marker.
+4. **Threshold Check:** If the active MemTable reaches **64 MB**, it is marked immutable. A new MemTable and WAL are created, and a background thread is queued to flush the immutable MemTable to disk.
+
+### Read Path (`get`)
+
+1. **Memory Search:** Query the active MemTable, then immutable MemTables in reverse chronological order.
+2. **Disk Search (SSTables):** Query Level 0 (newest) down to Level N (oldest):
+   - Check the in-memory **Bloom Filter** for the target SSTable.
+   - If positive, query the in-memory **Sparse Index** to find the 4 KB block offset.
+   - Load the block from disk and perform a binary search.
+
+---
+
+## Module Hierarchy
+
+```
+src/
+├── main.rs          — Entry point. Parses config, inits engine, boots Tokio server.
+├── server.rs        — HTTP handlers and routing. Depends only on the public API trait.
+├── db.rs            — LsmEngine struct. Glues MemTable, WAL, and versioning together.
+├── api.rs           — Public traits (StorageEngine) and common types.
+├── memtable.rs      — Wraps crossbeam-skiplist. In-memory insertions and lookups.
+├── wal.rs           — Append-only logging and crash recovery replay.
+├── sstable/
+│   ├── mod.rs
+│   ├── writer.rs    — Writes a 64MB .sst file (blocks, filters, index, footer).
+│   ├── reader.rs    — Parses footer, loads index/filter, binary searches blocks.
+│   └── block.rs     — Encoding/decoding of 4KB data blocks.
+├── versioning.rs    — Manages the append-only Manifest file.
+├── compaction.rs    — Background worker thread. Leveled K-way merge.
+└── iter.rs          — MergingIterator and min-heap logic.
+```
+
+---
+
+## Core Interfaces (Traits)
+
+### `StorageEngine` — The API Contract
+
+Decouples the Tokio server from the LSM implementation.
+
+```rust
+use async_trait::async_trait;
+
+#[async_trait]
+pub trait StorageEngine: Send + Sync {
+    async fn put(&self, key: String, value: Vec<u8>) -> Result<(), EngineError>;
+    async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, EngineError>;
+    async fn delete(&self, key: String) -> Result<(), EngineError>;
+    fn get_iterator(&self, low: String, high: String) -> Box<dyn KvIterator>;
+}
+```
+
+### `KvIterator` — The Universal Reader
+
+Used by both `get_iterator` and the compaction worker. Implementors: `MemTableIterator`, `SSTableIterator`, `MergingIterator`.
+
+```rust
+pub trait KvIterator: Send {
+    fn next(&mut self) -> Option<(String, Vec<u8>, u64)>;
+    fn is_valid(&self) -> bool;
+}
+```
+
+### `TableBuilder` — The Storage Writer
+
+Abstracts 4KB blocks, Bloom filters, and sparse indexes away from compaction logic.
+
+```rust
+pub trait TableBuilder {
+    fn append(&mut self, key: String, value: Vec<u8>, seq_num: u64);
+    fn finish(self) -> Result<SSTableMetadata, EngineError>;
+    fn estimated_size(&self) -> usize;
+}
+```
+
+---
+
+## Feature: Write-Ahead Log (WAL)
+
+> **Owner: Fernando (Partner B)**
+> **Module: `wal.rs`**
+> **Status: IMPLEMENTED**
+
+### Purpose
+
+The WAL guarantees crash recovery for data that lives in the MemTable but hasn't been flushed to an SSTable yet. It is append-only. Each active MemTable is paired with exactly one WAL file.
+
+### Summary
+
+Append-only binary log using a generic `Checksum` trait so the hashing algorithm can be swapped without touching I/O logic. The default implementation uses CRC32 (`crc32fast`). Files are named by zero-padded generation number (`00000000000000000001.wal`) so lexicographic order matches numeric order, enabling correct multi-file replay without additional metadata.
+
+### Key Structures
+
+- **`Checksum`** — Trait with `compute(data) -> u32` and a default `verify` method. Decouples checksum algorithm from record I/O.
+- **`Crc32Checksum`** — Production implementation backed by `crc32fast`.
+- **`WalOpType`** — Enum: `Put` or `Delete`.
+- **`WalRecord`** — Decoded record returned by `replay`: `{ seq_num, op, key, value }`.
+- **`Wal<C>`** — The active writer. Wraps a `BufWriter<File>` and owns the file path and generation number. Created with `Wal::create(dir, generation)` — fails if the file already exists.
+
+### Record Format
+
+Each WAL entry is a binary record with the following layout:
+
+| Field       | Size     | Description                           |
+|-------------|----------|---------------------------------------|
+| Checksum    | 4 bytes  | CRC32 over every byte after this field |
+| Seq Number  | 8 bytes  | Monotonically increasing sequence ID  |
+| OpType      | 1 byte   | `0x01` = Put, `0x02` = Delete         |
+| Key Len     | 4 bytes  | Length of the key in bytes            |
+| Key         | Variable | The key bytes                         |
+| Value Len   | 4 bytes  | Length of the value in bytes          |
+| Value       | Variable | The value bytes (empty for deletes)   |
+
+All multi-byte integers are little-endian.
+
+### Recovery
+
+- **`replay(path)`** — Reads one WAL file. Stops at the first record whose checksum fails — that record was a partial write interrupted by a crash. All prior records are returned as valid.
+- **`recover_all(dir)`** — Scans a directory for all `*.wal` files, sorts them by generation number, and calls `replay` on each in order. Called by `LsmEngine::open` on startup. WAL files for already-flushed MemTables will have been deleted, so only unflushed generations are present.
+
+### Responsibilities
+
+1. **Append:** Every `put` or `delete` must be sequentially appended to the WAL *before* being inserted into the MemTable. This is the durability guarantee.
+2. **Recovery/Replay:** On startup, read the WAL file(s) and replay every record back into the MemTable to restore pre-crash state.
+3. **Rotation:** When the active MemTable is frozen (hits 64 MB), a new WAL file is created alongside the new active MemTable. The old WAL persists until its paired MemTable has been successfully flushed to an SSTable on disk.
+4. **Cleanup:** After a successful SSTable flush, the old WAL file can be safely deleted.
+
+### Integration Points
+
+- **`db.rs` (LsmEngine):** The engine coordinates the WAL. On every write, `db.rs` calls WAL append, then MemTable insert. On startup, `db.rs` calls WAL replay to rebuild the MemTable.
+- **`memtable.rs`:** During replay, the WAL feeds records back into the MemTable using the same `put` interface.
+- **Background Flusher (Phase 2):** After a successful flush to SSTable, the flusher signals that the old WAL can be deleted via `Wal::delete`.
+
+### Known Limitations
+
+- **WAL–MemTable pairing race:** In a concurrent scenario, writes that arrive between a MemTable freeze and the subsequent WAL rotation are appended to the old WAL but inserted into the new MemTable. No data is lost today (all WAL files are replayed on recovery), but when Phase 2 introduces WAL deletion, the flusher must account for this — deleting a WAL file is only safe once it can be confirmed that all its records are covered by a flushed SSTable.
+- **No fsync per write:** `append_put`/`append_delete` flush the `BufWriter` to the OS page cache but do not call `fsync`. Data survives process crashes but not power loss. Call `Wal::sync()` for stronger durability guarantees at the cost of one fsync per write.
+
+---
+
+## Feature: MemTable
+
+> **Owner: Gabriel (Partner A)**
+> **Module: `memtable.rs`**
+> **Status: ALREADY IMPLEMENTED**
+
+### Summary
+
+Lock-free concurrent skip list (`crossbeam-skiplist`) serving as the in-memory write buffer. Supports MVCC via composite `InternalKey` (user_key ascending, seq_num descending).
+
+### Key Structures
+
+- **`Record`** — Enum: `Put(Vec<u8>)` or `Delete` (tombstone).
+- **`InternalKey`** — Composite key `{ user_key: String, seq_num: u64 }`. Sorted ascending by key, descending by seq_num.
+- **`CrossbeamMemTable`** — The physical implementation. Fields: `map: Arc<SkipMap<InternalKey, Record>>`, `approximate_size: AtomicUsize`, `active_writers: AtomicUsize`.
+- **`MemTableIterator`** — Iterates the skip list with eager key caching for safe concurrent reads.
+
+### State Management (`state.rs`)
+
+- **`MemTableState`** — Thread-safe orchestrator using `RwLock<Arc<InnerState>>` (Copy-on-Write pattern).
+- **`put()`** returns `true` when the active table needs to be frozen, signaling the engine to wake the flusher.
+- **`freeze_active()`** uses double-checked locking with `Arc::ptr_eq()` to prevent thundering herd races.
+- **`get_oldest_immutable()`** / **`drop_immutable()`** — Used by the background flusher to safely consume and release frozen tables.
+
+### Concurrency Mitigations
+
+- **Thundering Herd:** Double-checked locking on freeze with `Arc::ptr_eq`.
+- **Missed Write:** `active_writers` atomic barrier — flusher spin-waits until zero before iterating.
+- **Lock Contention:** CoW via `RwLock<Arc<T>>` — readers clone the Arc in nanoseconds.
+- **Use-After-Free:** Arc reference counting keeps memory alive for slow readers.
+- **Shifting Ground:** Eager next-key caching with fresh `lower_bound` searches per iteration.
+
+### Configuration
+
+- Active MemTable size limit: **64 MB**
+- Max immutable MemTables in RAM: **4** (backpressure stalls writes if exceeded)
+
+---
+
+## Feature: Engine Coordinator
+
+> **Owner: Fernando (Partner B)**
+> **Module: `db.rs`**
+> **Status: IMPLEMENTED**
+
+### Summary
+
+`LsmEngine` is the central coordinator that glues `MemTableState` and `Wal` together into a single public interface. It owns the global sequence number counter and the active WAL, and is the only component that knows about both. Designed to be shared across threads via `Arc<LsmEngine>` — all methods take `&self`.
+
+### Key Structures
+
+- **`LsmEngine`** — The top-level engine struct. Fields:
+  - `state: MemTableState` — manages the active and immutable MemTables
+  - `active_wal: Mutex<Wal<Crc32Checksum>>` — the WAL file paired with the current active MemTable
+  - `next_seq: AtomicU64` — monotonically increasing sequence number, shared across all writes
+  - `next_wal_gen: AtomicU64` — generation counter for naming new WAL files on rotation
+  - `data_dir: PathBuf` — directory where WAL files are stored
+
+### Write Path
+
+1. Atomically fetch-and-increment `next_seq` to claim a unique sequence number
+2. Lock the WAL mutex, append the record, release the lock
+3. Insert into `MemTableState` (lock-free at the skip list level)
+4. If `MemTableState::put` returns `true` (freeze occurred), call `rotate_wal`
+
+### Read Path
+
+1. Delegate to `MemTableState::get` — checks the active MemTable, then immutables in reverse chronological order
+2. Translate the internal `Record` enum to the public API: `Record::Put(v)` → `Some(v)`, `Record::Delete` → `None`
+
+### Recovery (`open`)
+
+1. Call `recover_all` to replay all `*.wal` files in the data directory in generation order
+2. Compute the highest existing WAL generation to continue numbering from
+3. Set `next_seq` to `max_replayed_seq + 1` so post-recovery writes never reuse a sequence number
+4. Replay each record into `MemTableState` (freeze signals are ignored during replay — no WAL writes happen)
+5. Create a new WAL file at `next_gen` for ongoing writes
+
+### WAL Rotation
+
+When a freeze occurs, `rotate_wal` increments `next_wal_gen`, creates a new WAL file, and replaces the one inside the Mutex. The old WAL file remains on disk, paired with the now-immutable MemTable, until Phase 2 deletes it after a successful SSTable flush.
+
+### Configuration
+
+- `MAX_MEMTABLE_SIZE`: **64 MB**
+- `MAX_IMMUTABLE_TABLES`: **4**
+
+### Known Limitations
+
+- **WAL–MemTable pairing race:** See WAL Known Limitations. The engine inherits this issue — it is a Phase 2 concern.
+- **Backpressure not wired:** `MemTableState::is_flush_falling_behind` is never checked. Writes are not stalled when immutable MemTables accumulate past the limit of 4. This is intentional until the background flusher exists in Phase 2.
+- **WAL not fsynced:** Writes survive process crashes but not power loss. Calling `Wal::sync()` after each append would provide stronger guarantees at the cost of one fsync per write.
+
+---
+
+## Feature: SSTables (On-Disk Storage)
+
+> **Module: `sstable/` (writer.rs, reader.rs, block.rs)**
+
+### File Layout
+
+Each SSTable targets **64 MB**, divided into **4 KB Data Blocks**:
+
+1. **Data Blocks** — Sequentially stored, sorted KV pairs.
+2. **Meta Block (Bloom Filter)** — Serialized Bloom Filter for all keys in the file.
+3. **Index Block (Sparse Index)** — Highest key of every 4 KB block + byte offset.
+4. **Footer** — Fixed-size trailer (~48 bytes) with pointers to Meta and Index blocks.
+
+### Startup Loading
+
+On startup, the engine reads the Footer of each valid SSTable (per the Manifest), loads the Bloom Filter and Sparse Index into RAM, and keeps them resident for the file's lifetime.
+
+---
+
+## Feature: Manifest (Version Tracking)
+
+> **Module: `versioning.rs`**
+
+### Purpose
+
+Append-only log of metadata changes that tracks the state of the LSM-tree across crashes.
+
+### Mechanics
+
+- On flush or compaction completion, a "Version Edit" is appended (e.g., `+ SSTable 15 to L1`, `- SSTable 8 from L0`).
+- On startup, the engine replays the Manifest to rebuild the in-memory metadata table tracking every active SSTable file, its level, and its smallest/largest key.
+
+---
+
+## Feature: Leveled Compaction
+
+> **Module: `compaction.rs`, `iter.rs`**
+
+### Level Rules
+
+- **Level 0 (L0):** Files flushed directly from MemTables. Key ranges **can overlap**.
+- **Level 1+ (L1–LN):** Files **must not overlap**. Strict global order by smallest key.
+
+### Compaction Trigger
+
+When a level exceeds its size threshold (e.g., L1 > 640 MB):
+
+1. **Pick Victim:** Select a file from L_i.
+2. **Find Overlaps:** Find all files in L_{i+1} whose key ranges overlap the victim.
+3. **Merge:** Stream KV pairs from all selected files into a min-heap. Filter out overwritten keys and stale tombstones.
+4. **Write & Swap:** Write output to new 64 MB SSTable files in L_{i+1}. Append a Version Edit to the Manifest, update in-memory metadata, delete old files.
+
+### Compaction Pseudocode
+
+```rust
+fn compact_sstables(input_files: Vec<SSTable>) -> Vec<SSTable> {
+    let mut min_heap = PriorityQueue::new();
+    let mut current_writer = SSTableWriter::new();
+    let mut new_sstables = Vec::new();
+
+    for (id, file) in input_files.iter().enumerate() {
+        let mut iter = file.get_iterator();
+        if let Some((k, v, seq)) = iter.next() {
+            min_heap.push(HeapItem { k, v, seq, id, iter });
+        }
+    }
+
+    let mut last_key = None;
+    while let Some(mut item) = min_heap.pop() {
+        if last_key == Some(item.k.clone()) {
+            advance_iter(&mut item, &mut min_heap);
+            continue;
+        }
+        if !is_stale_tombstone(&item) {
+            if current_writer.size() >= MAX_FILE_SIZE {
+                new_sstables.push(current_writer.finish());
+                current_writer = SSTableWriter::new();
+            }
+            current_writer.append(item.k.clone(), item.v.clone());
+        }
+        last_key = Some(item.k.clone());
+        advance_iter(&mut item, &mut min_heap);
+    }
+
+    if current_writer.size() > 0 {
+        new_sstables.push(current_writer.finish());
+    }
+    new_sstables
+}
+```
+
+---
+
+## Feature: Tokio HTTP Server
+
+> **Module: `server.rs`**
+
+Async HTTP server wrapping the engine in an `Arc`. Exposes REST endpoints (e.g., `POST /kv/{key}`, `GET /kv/{key}`). Depends only on the `StorageEngine` trait, never on internal engine structs.
+
+---
+
+## Stretch Goal: Distributed Replication (Raft)
+
+Scale the engine using the **Raft consensus algorithm**. The Raft log serves as the distributed WAL. Each node is a replicated state machine — writes are applied to the local LSM-tree only after a majority of nodes acknowledge.
+
+---
+
+## Timeline
+
+| Phase | Dates | Gabriel (Partner A) | Fernando / You (Partner B) |
+|-------|-------|-----------|-----------------|
+| **1: In-Memory Engine & Durability** | Mar 30 – Apr 4 | Gabriel: SkipList MemTable + core API | **Fernando: WAL** — append logic + recovery replay |
+| **2: Disk Persistence** | Apr 5 – Apr 9 | Gabriel: SSTable Writer | **Fernando:** Background flusher + **Manifest file** |
+| **3: Read Path & Compaction** | Apr 10 – Apr 13 | Gabriel: SSTable Reader + full get path | **Fernando: Compaction Worker** (K-way merge) |
+| **4: Networking & Polish** | Apr 14 – Apr 16 | Gabriel: Tokio HTTP Server | **Fernando:** Integration testing + benchmarking |
+
+### Milestones
+
+- **Apr 4:** Write, read, and survive a process kill without data loss.
+- **Apr 9:** Engine no longer runs out of memory. L0 `.sst` files created on disk.
+- **Apr 13:** Full read path from disk. Compaction prevents infinite disk growth.
+- **Apr 16:** Final submission.
+
+---
+
+## Recommended Crates
+
+Don't reimplement what already exists — use stable crates:
+
+- `crossbeam` — lock-free SkipList
+- `tokio` — async runtime
+- `bloomfilter` — Bloom filter implementation
+- `async-trait` — async trait support
+- `crc32fast` or similar — WAL checksum
