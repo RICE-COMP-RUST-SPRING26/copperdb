@@ -441,4 +441,51 @@ mod tests {
             panic!("Expected Put record");
         }
     }
+
+    #[test]
+    fn test_reader_search_large_record_spanning_multiple_blocks() {
+        let file = TempFileGuard::new("read_large_record.sst");
+        
+        // Create a 10KB value, which is significantly larger than a standard 4KB block
+        let large_val_size = 10 * 1024;
+        let mut large_val = vec![0u8; large_val_size];
+        
+        // Fill it with a predictable pattern to verify data integrity later
+        for i in 0..large_val_size {
+            large_val[i] = (i % 256) as u8;
+        }
+
+        // Build an SSTable with the large record sandwiched between two normal records
+        build_test_sst(file.path_str(), vec![
+            ("a_small".to_string(), Record::Put(b("tiny")), 3),
+            ("b_large".to_string(), Record::Put(large_val.clone()), 2),
+            ("c_small".to_string(), Record::Put(b("tiny_again")), 1),
+        ]);
+
+        let mut reader = SsTableReader::open(file.path_str()).unwrap();
+
+        // 1. Retrieve and verify the massive record
+        let (k, r) = reader.search("b_large").unwrap().expect("large key should exist");
+        
+        assert_eq!(k.user_key, "b_large");
+        assert_eq!(k.seq_num, 2);
+        
+        if let Record::Put(val) = r {
+            assert_eq!(val.len(), large_val_size, "The retrieved value should be exactly 10KB");
+            // Check that the data wasn't corrupted or truncated across block boundaries
+            assert_eq!(val, large_val, "The retrieved data pattern should perfectly match");
+        } else {
+            panic!("Expected Put record for b_large");
+        }
+
+        // 2. Verify the key located AFTER the massive block is still indexed and readable
+        let (k2, r2) = reader.search("c_small").unwrap().expect("small key after large should exist");
+        assert_eq!(k2.user_key, "c_small");
+        assert!(matches!(r2, Record::Put(v) if v == b("tiny_again")));
+        
+        // 3. Verify the key located BEFORE the massive block
+        let (k1, r1) = reader.search("a_small").unwrap().expect("small key before large should exist");
+        assert_eq!(k1.user_key, "a_small");
+        assert!(matches!(r1, Record::Put(v) if v == b("tiny")));
+    }
 }
