@@ -5,7 +5,7 @@ use std::io::Write;
 use crate::core::{InternalKey, KvIterator, Record};
 use crate::sstable::block::BlockBuilder;
 use crate::sstable::{
-    FOOTER_SIZE, INDEX_OFFSET_SIZE, IndexOffset, MAGIC_NUMBER, MAGIC_SIZE,
+    FOOTER_SIZE, INDEX_OFFSET_SIZE, IndexOffset, MAGIC_NUMBER, MAGIC_SIZE, MagicNumber,
 };
 
 #[derive(thiserror::Error, Debug)]
@@ -275,14 +275,14 @@ mod tests {
         assert!(data.len() >= FOOTER_SIZE);
 
         let len = data.len();
-        let magic = u64::from_be_bytes(data[len - 8..len].try_into().unwrap());
+        let magic = MagicNumber::from_be_bytes(data[len - MAGIC_SIZE..len].try_into().unwrap());
         assert_eq!(
-            magic, 0xDEADBEEFCAFEBABEu64,
+            magic, MAGIC_NUMBER,
             "Footer magic number is missing/corrupted"
         );
 
         let index_offset =
-            u64::from_be_bytes(data[len - FOOTER_SIZE..len - 8].try_into().unwrap()) as usize;
+            IndexOffset::from_be_bytes(data[len - FOOTER_SIZE..len - MAGIC_SIZE].try_into().unwrap()) as usize;
         assert_eq!(
             index_offset, 0,
             "Since there are no data blocks, index offset should be 0"
@@ -318,7 +318,7 @@ mod tests {
         let len = data.len();
 
         let index_offset =
-            u64::from_be_bytes(data[len - FOOTER_SIZE..len - 8].try_into().unwrap()) as usize;
+            IndexOffset::from_be_bytes(data[len - FOOTER_SIZE..len - MAGIC_SIZE].try_into().unwrap()) as usize;
 
         // 1. Verify Index Block
         let index_data = data[index_offset..len - FOOTER_SIZE].to_vec();
@@ -384,7 +384,7 @@ mod tests {
         let len = data.len();
 
         let index_offset =
-            u64::from_be_bytes(data[len - FOOTER_SIZE..len - 8].try_into().unwrap()) as usize;
+            IndexOffset::from_be_bytes(data[len - FOOTER_SIZE..len - MAGIC_SIZE].try_into().unwrap()) as usize;
 
         // 1. Verify Index Block has multiple pointers
         let index_data = data[index_offset..len - FOOTER_SIZE].to_vec();
