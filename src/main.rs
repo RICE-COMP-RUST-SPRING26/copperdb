@@ -3,7 +3,7 @@ mod db;
 mod memtable;
 mod wal;
 mod core;
-mod versioning;
+mod manifest;
 
 fn main() {
     println!("Hello, world!");

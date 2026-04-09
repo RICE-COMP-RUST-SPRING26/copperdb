@@ -252,7 +252,7 @@ fn replay(path: &Path) -> Result<VersionState, ManifestError> {
             Err(e) => return Err(e.into()),
         }
         let expected_crc = u32::from_be_bytes(crc_buf);
-        byte_offset += 4;
+        byte_offset += CRC_SIZE as u64;
 
         // Read edit type
         let mut type_buf = [0u8; EDIT_TYPE_SIZE];
@@ -328,7 +328,7 @@ fn replay(path: &Path) -> Result<VersionState, ManifestError> {
             }
         };
 
-        byte_offset += 1 + 9; // type byte + file_id + level
+        byte_offset += (EDIT_TYPE_SIZE + FILE_ID_SIZE + LEVEL_SIZE) as u64;
         state.apply(&edit);
     }
 
@@ -349,7 +349,7 @@ mod tests {
         static COUNTER: AtomicUsize = AtomicUsize::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
         let p = std::env::temp_dir()
-            .join(format!("copperdb_versioning_{}_{}", std::process::id(), id));
+            .join(format!("copperdb_manifest_{}_{}", std::process::id(), id));
         std::fs::create_dir_all(&p).unwrap();
         p
     }

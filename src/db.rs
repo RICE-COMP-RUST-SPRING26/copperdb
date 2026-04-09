@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::core::Record;
 use crate::memtable::state::MemTableState;
 use crate::wal::{Crc32Checksum, Wal, WalOpType, recover_all};
-use crate::versioning::{Manifest, VersionEdit, VersionState};
+use crate::manifest::{Manifest, VersionEdit, VersionState};
 
 const MAX_MEMTABLE_SIZE: usize = 64 * 1024 * 1024;
 const MAX_IMMUTABLE_TABLES: usize = 4;
