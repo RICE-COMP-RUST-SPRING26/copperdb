@@ -17,8 +17,32 @@ pub enum ManifestError {
 use crate::wal::Crc32Checksum;
 use crate::wal::Checksum;
 
-const EDIT_ADD_FILE: u8    = 0x01;
-const EDIT_REMOVE_FILE: u8 = 0x02;
+pub type FileId = u64;
+pub type Level  = u8;
+
+const FILE_ID_SIZE:    usize = size_of::<FileId>();
+const LEVEL_SIZE:      usize = size_of::<Level>();
+const CRC_SIZE:        usize = size_of::<u32>();
+const KEY_LEN_SIZE:    usize = size_of::<u32>();
+const EDIT_TYPE_SIZE:  usize = size_of::<u8>(); // EditType is #[repr(u8)]
+
+#[repr(u8)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum EditType {
+    AddFile    = 0x01,
+    RemoveFile = 0x02,
+}
+
+impl TryFrom<u8> for EditType {
+    type Error = ();
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0x01 => Ok(EditType::AddFile),
+            0x02 => Ok(EditType::RemoveFile),
+            _    => Err(()),
+        }
+    }
+}
 
 const NUM_LEVELS: usize = 7;
 const MANIFEST_FILENAME: &str = "MANIFEST";
@@ -37,8 +61,8 @@ pub fn sst_path(dir: &Path, file_id: u64) -> PathBuf {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SstableMetadata {
-    pub file_id:      u64,
-    pub level:        u8,
+    pub file_id:      FileId,
+    pub level:        Level,
     pub smallest_key: String,
     pub largest_key:  String,
 }
@@ -46,14 +70,14 @@ pub struct SstableMetadata {
 #[derive(Clone, Debug, PartialEq)]
 pub enum VersionEdit {
     AddFile {
-        level:        u8,
-        file_id:      u64,
+        level:        Level,
+        file_id:      FileId,
         smallest_key: String,
         largest_key:  String,
     },
     RemoveFile {
-        level:   u8,
-        file_id: u64,
+        level:   Level,
+        file_id: FileId,
     },
 }
 
@@ -183,11 +207,11 @@ fn serialize_edit(edit: &VersionEdit) -> Vec<u8> {
             let sk = smallest_key.as_bytes();
             let lk = largest_key.as_bytes();
             let mut buf = Vec::with_capacity(
-                1 + size_of::<u64>() + 1 +
-                size_of::<u32>() + sk.len() +
-                size_of::<u32>() + lk.len(),
+                EDIT_TYPE_SIZE + FILE_ID_SIZE + LEVEL_SIZE +
+                KEY_LEN_SIZE + sk.len() +
+                KEY_LEN_SIZE + lk.len(),
             );
-            buf.push(EDIT_ADD_FILE);
+            buf.push(EditType::AddFile as u8);
             buf.extend_from_slice(&file_id.to_be_bytes());
             buf.push(*level);
             buf.extend_from_slice(&(sk.len() as u32).to_be_bytes());
@@ -197,8 +221,8 @@ fn serialize_edit(edit: &VersionEdit) -> Vec<u8> {
             buf
         }
         VersionEdit::RemoveFile { level, file_id } => {
-            let mut buf = Vec::with_capacity(1 + size_of::<u64>() + 1);
-            buf.push(EDIT_REMOVE_FILE);
+            let mut buf = Vec::with_capacity(EDIT_TYPE_SIZE + FILE_ID_SIZE + LEVEL_SIZE);
+            buf.push(EditType::RemoveFile as u8);
             buf.extend_from_slice(&file_id.to_be_bytes());
             buf.push(*level);
             buf
@@ -221,7 +245,7 @@ fn replay(path: &Path) -> Result<VersionState, ManifestError> {
     let mut byte_offset: u64 = 0;
 
     loop {
-        let mut crc_buf = [0u8; 4];
+        let mut crc_buf = [0u8; CRC_SIZE];
         match reader.read_exact(&mut crc_buf) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
@@ -231,31 +255,33 @@ fn replay(path: &Path) -> Result<VersionState, ManifestError> {
         byte_offset += 4;
 
         // Read edit type
-        let mut type_buf = [0u8; 1];
+        let mut type_buf = [0u8; EDIT_TYPE_SIZE];
         if reader.read_exact(&mut type_buf).is_err() {
             break;
         }
-        let edit_type = type_buf[0];
+        let raw_type = type_buf[0];
+        let edit_type = EditType::try_from(raw_type)
+            .map_err(|_| ManifestError::UnknownEditType(raw_type, byte_offset))?;
 
         // Read file_id (8B) + level (1B) — present in both variants
-        let mut id_level_buf = [0u8; 9];
+        let mut id_level_buf = [0u8; FILE_ID_SIZE + LEVEL_SIZE];
         if reader.read_exact(&mut id_level_buf).is_err() {
             break;
         }
-        let file_id = u64::from_be_bytes(id_level_buf[0..8].try_into().unwrap());
-        let level   = id_level_buf[8];
+        let file_id = FileId::from_be_bytes(id_level_buf[0..FILE_ID_SIZE].try_into().unwrap());
+        let level   = id_level_buf[FILE_ID_SIZE];
 
         let edit = match edit_type {
-            EDIT_ADD_FILE => {
+            EditType::AddFile => {
                 // smallest_key_len (4B) + smallest_key + largest_key_len (4B) + largest_key
-                let mut sk_len_buf = [0u8; 4];
+                let mut sk_len_buf = [0u8; KEY_LEN_SIZE];
                 if reader.read_exact(&mut sk_len_buf).is_err() { break; }
                 let sk_len = u32::from_be_bytes(sk_len_buf) as usize;
 
                 let mut sk_buf = vec![0u8; sk_len];
                 if reader.read_exact(&mut sk_buf).is_err() { break; }
 
-                let mut lk_len_buf = [0u8; 4];
+                let mut lk_len_buf = [0u8; KEY_LEN_SIZE];
                 if reader.read_exact(&mut lk_len_buf).is_err() { break; }
                 let lk_len = u32::from_be_bytes(lk_len_buf) as usize;
 
@@ -263,8 +289,11 @@ fn replay(path: &Path) -> Result<VersionState, ManifestError> {
                 if reader.read_exact(&mut lk_buf).is_err() { break; }
 
                 // Verify CRC before accepting the record
-                let mut payload = Vec::with_capacity(1 + 9 + 4 + sk_len + 4 + lk_len);
-                payload.push(edit_type);
+                let mut payload = Vec::with_capacity(
+                    EDIT_TYPE_SIZE + FILE_ID_SIZE + LEVEL_SIZE +
+                    KEY_LEN_SIZE + sk_len + KEY_LEN_SIZE + lk_len,
+                );
+                payload.push(raw_type);
                 payload.extend_from_slice(&id_level_buf);
                 payload.extend_from_slice(&sk_len_buf);
                 payload.extend_from_slice(&sk_buf);
@@ -286,9 +315,9 @@ fn replay(path: &Path) -> Result<VersionState, ManifestError> {
 
                 VersionEdit::AddFile { level, file_id, smallest_key, largest_key }
             }
-            EDIT_REMOVE_FILE => {
-                let mut payload = Vec::with_capacity(1 + 9);
-                payload.push(edit_type);
+            EditType::RemoveFile => {
+                let mut payload = Vec::with_capacity(EDIT_TYPE_SIZE + FILE_ID_SIZE + LEVEL_SIZE);
+                payload.push(raw_type);
                 payload.extend_from_slice(&id_level_buf);
 
                 if !Crc32Checksum::verify(&payload, expected_crc) {
@@ -297,7 +326,6 @@ fn replay(path: &Path) -> Result<VersionState, ManifestError> {
 
                 VersionEdit::RemoveFile { level, file_id }
             }
-            _ => return Err(ManifestError::UnknownEditType(edit_type, byte_offset)),
         };
 
         byte_offset += 1 + 9; // type byte + file_id + level
