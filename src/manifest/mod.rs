@@ -104,12 +104,25 @@ impl VersionState {
                 if level >= self.levels.len() {
                     self.levels.resize(level + 1, Vec::new());
                 }
-                self.levels[level].push(SstableMetadata {
+                let meta = SstableMetadata {
                     file_id:      *file_id,
                     level:        level as u8,
                     smallest_key: smallest_key.clone(),
                     largest_key:  largest_key.clone(),
-                });
+                };
+                if level == 0 {
+                    // L0 files may have overlapping key ranges; preserve flush
+                    // order so reads can scan newest-first by iterating in reverse.
+                    self.levels[0].push(meta);
+                } else {
+                    // L1+ files must have non-overlapping, globally sorted key
+                    // ranges. Insert at the sorted position so binary search over
+                    // the level is always valid — both during replay and after
+                    // each compaction that adds new files.
+                    let pos = self.levels[level]
+                        .partition_point(|m| m.smallest_key < *smallest_key);
+                    self.levels[level].insert(pos, meta);
+                }
             }
             VersionEdit::RemoveFile { level, file_id } => {
                 let level = *level as usize;
@@ -514,5 +527,51 @@ mod tests {
         use std::path::Path;
         let p = sst_path(Path::new("/data"), 42);
         assert_eq!(p.to_str().unwrap(), "/data/00000000000000000042.sst");
+    }
+
+    // L1+ files added in reverse key order must come back sorted by smallest_key.
+    // Without the sorted-insert fix, files_at_level(1) would return [mango, date, apple].
+    #[test]
+    fn l1_files_sorted_after_out_of_order_apply() {
+        let mut state = VersionState::new();
+        state.apply(&add(3, 1, "mango", "peach"));
+        state.apply(&add(1, 1, "apple", "cherry"));
+        state.apply(&add(2, 1, "date",  "grape"));
+
+        let files = state.files_at_level(1);
+        let keys: Vec<&str> = files.iter().map(|m| m.smallest_key.as_str()).collect();
+        assert_eq!(keys, vec!["apple", "date", "mango"]);
+    }
+
+    // Same invariant must hold after a round-trip through the manifest file,
+    // since replay replays edits in the order they were appended (not key order).
+    #[test]
+    fn l1_files_sorted_after_replay() {
+        let dir = tmp_dir();
+
+        {
+            let (mut m, _) = Manifest::open_or_create(&dir).unwrap();
+            m.append(&add(3, 1, "mango", "peach")).unwrap();
+            m.append(&add(1, 1, "apple", "cherry")).unwrap();
+            m.append(&add(2, 1, "date",  "grape")).unwrap();
+        }
+
+        let (_, state) = Manifest::open_or_create(&dir).unwrap();
+        let files = state.files_at_level(1);
+        let keys: Vec<&str> = files.iter().map(|m| m.smallest_key.as_str()).collect();
+        assert_eq!(keys, vec!["apple", "date", "mango"]);
+    }
+
+    // L0 must preserve flush order (newest file last, so iterating in reverse
+    // visits newest-first), not sort by key.
+    #[test]
+    fn l0_files_preserve_insertion_order() {
+        let mut state = VersionState::new();
+        state.apply(&add(1, 0, "mango", "peach"));
+        state.apply(&add(2, 0, "apple", "cherry"));
+        state.apply(&add(3, 0, "date",  "grape"));
+
+        let ids: Vec<u64> = state.files_at_level(0).iter().map(|m| m.file_id).collect();
+        assert_eq!(ids, vec![1, 2, 3]);
     }
 }
