@@ -574,4 +574,248 @@ mod tests {
         let ids: Vec<u64> = state.files_at_level(0).iter().map(|m| m.file_id).collect();
         assert_eq!(ids, vec![1, 2, 3]);
     }
+
+    // -----------------------------------------------------------------------
+    // Concurrency tests
+    //
+    // These tests drive the CoW pattern used by LsmEngine:
+    //   RwLock<Arc<VersionState>>
+    //   write: clone current Arc → mutate copy → swap
+    //   read:  clone the Arc and release the lock immediately
+    // -----------------------------------------------------------------------
+
+    // N threads each flush one file to L0 concurrently. Because every writer
+    // holds the write lock for the duration of its CoW swap, no update can be
+    // lost — the last writer always starts from the version left by the
+    // second-to-last writer.
+    #[test]
+    fn concurrent_cow_flushes_all_files_visible() {
+        use std::sync::{Arc, RwLock};
+        use std::thread;
+
+        let version: Arc<RwLock<Arc<VersionState>>> =
+            Arc::new(RwLock::new(Arc::new(VersionState::new())));
+
+        const N_THREADS: usize = 8;
+        const FILES_PER_THREAD: usize = 10;
+
+        let handles: Vec<_> = (0..N_THREADS)
+            .map(|t| {
+                let version = Arc::clone(&version);
+                thread::spawn(move || {
+                    for i in 0..FILES_PER_THREAD {
+                        let file_id = (t * FILES_PER_THREAD + i) as u64;
+                        let key = format!("{:08}", file_id);
+                        let edit = VersionEdit::AddFile {
+                            level: 0,
+                            file_id,
+                            smallest_key: key.clone(),
+                            largest_key: key,
+                        };
+                        let mut guard = version.write().unwrap();
+                        let mut new_v = (**guard).clone();
+                        new_v.apply(&edit);
+                        *guard = Arc::new(new_v);
+                    }
+                })
+            })
+            .collect();
+
+        for h in handles { h.join().unwrap(); }
+
+        let final_v = Arc::clone(&*version.read().unwrap());
+        assert_eq!(final_v.files_at_level(0).len(), N_THREADS * FILES_PER_THREAD);
+    }
+
+    // An Arc snapshot captured before a wave of concurrent flushes must still
+    // reflect the pre-flush state after those flushes complete. The live version
+    // must reflect all of the new files.
+    #[test]
+    fn snapshot_stable_during_concurrent_flushes() {
+        use std::sync::{Arc, RwLock};
+        use std::thread;
+
+        let version: Arc<RwLock<Arc<VersionState>>> =
+            Arc::new(RwLock::new(Arc::new(VersionState::new())));
+
+        // Seed one file before taking the snapshot.
+        {
+            let mut guard = version.write().unwrap();
+            let mut v = (**guard).clone();
+            v.apply(&add(0, 0, "seed", "seed"));
+            *guard = Arc::new(v);
+        }
+
+        let snapshot = Arc::clone(&*version.read().unwrap());
+        assert_eq!(snapshot.files_at_level(0).len(), 1);
+
+        const N: usize = 20;
+        let handles: Vec<_> = (1..=N)
+            .map(|i| {
+                let version = Arc::clone(&version);
+                thread::spawn(move || {
+                    let key = format!("{:08}", i);
+                    let edit = VersionEdit::AddFile {
+                        level: 0,
+                        file_id: i as u64,
+                        smallest_key: key.clone(),
+                        largest_key: key,
+                    };
+                    let mut guard = version.write().unwrap();
+                    let mut new_v = (**guard).clone();
+                    new_v.apply(&edit);
+                    *guard = Arc::new(new_v);
+                })
+            })
+            .collect();
+
+        for h in handles { h.join().unwrap(); }
+
+        // The snapshot is frozen — it must still show only the seed file.
+        assert_eq!(snapshot.files_at_level(0).len(), 1);
+
+        // The live version must show every file.
+        let live = Arc::clone(&*version.read().unwrap());
+        assert_eq!(live.files_at_level(0).len(), N + 1);
+    }
+
+    // N threads concurrently add non-overlapping L1 files in an arbitrary order.
+    // Because each writer starts its CoW from the version left by the previous
+    // writer, and apply() inserts at the sorted position, the final level must
+    // be in ascending smallest_key order regardless of which thread won each
+    // write-lock acquisition.
+    #[test]
+    fn l1_sorted_invariant_preserved_under_concurrent_cow_adds() {
+        use std::sync::{Arc, RwLock};
+        use std::thread;
+
+        let version: Arc<RwLock<Arc<VersionState>>> =
+            Arc::new(RwLock::new(Arc::new(VersionState::new())));
+
+        // Each tuple is (file_id, key). Deliberately not in key order.
+        let files: &[(u64, &str)] = &[
+            (5, "echo"),     (1, "apple"),  (3, "cherry"),   (7, "grape"),
+            (2, "banana"),   (6, "fig"),    (4, "date"),     (8, "honeydew"),
+        ];
+
+        let handles: Vec<_> = files
+            .iter()
+            .map(|&(file_id, key)| {
+                let version = Arc::clone(&version);
+                let key = key.to_string();
+                thread::spawn(move || {
+                    let edit = VersionEdit::AddFile {
+                        level: 1,
+                        file_id,
+                        smallest_key: key.clone(),
+                        largest_key: key,
+                    };
+                    let mut guard = version.write().unwrap();
+                    let mut new_v = (**guard).clone();
+                    new_v.apply(&edit);
+                    *guard = Arc::new(new_v);
+                })
+            })
+            .collect();
+
+        for h in handles { h.join().unwrap(); }
+
+        let final_v = Arc::clone(&*version.read().unwrap());
+        assert_eq!(final_v.files_at_level(1).len(), files.len());
+
+        let keys: Vec<&str> = final_v
+            .files_at_level(1)
+            .iter()
+            .map(|m| m.smallest_key.as_str())
+            .collect();
+        assert_eq!(keys, vec!["apple", "banana", "cherry", "date", "echo", "fig", "grape", "honeydew"]);
+    }
+
+    // Readers must never observe a version mid-apply. The CoW swap (replacing
+    // the Arc under the write lock) is atomic from the reader's perspective:
+    // a reader either gets the version from before an apply or the one after,
+    // never a partial state where only some files of a batch have been inserted.
+    //
+    // Each writer applies a two-file compaction batch (one remove + one add)
+    // atomically. A reader that sees the pre-compaction file count must not
+    // see the post-compaction add without also seeing the remove, and vice versa.
+    #[test]
+    fn readers_never_observe_partial_compaction() {
+        use std::sync::{Arc, Barrier, RwLock};
+        use std::thread;
+
+        let version: Arc<RwLock<Arc<VersionState>>> =
+            Arc::new(RwLock::new(Arc::new(VersionState::new())));
+
+        // Seed two L1 files that compaction will replace.
+        {
+            let mut guard = version.write().unwrap();
+            let mut v = (**guard).clone();
+            v.apply(&add(1, 1, "apple", "fig"));
+            v.apply(&add(2, 1, "grape", "mango"));
+            *guard = Arc::new(v);
+        }
+
+        const N_READERS: usize = 6;
+        let barrier = Arc::new(Barrier::new(N_READERS + 1));
+        let any_partial = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let reader_handles: Vec<_> = (0..N_READERS)
+            .map(|_| {
+                let version = Arc::clone(&version);
+                let barrier = Arc::clone(&barrier);
+                let any_partial = Arc::clone(&any_partial);
+                thread::spawn(move || {
+                    barrier.wait();
+                    for _ in 0..200 {
+                        let v = Arc::clone(&*version.read().unwrap());
+                        let count = v.files_at_level(1).len();
+                        // Valid states: 2 (pre-compaction) or 1 (post-compaction).
+                        // A partial apply would produce 0 (both removed, none added)
+                        // or 3 (add visible before remove).
+                        if count != 1 && count != 2 {
+                            any_partial.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        // One writer performs the compaction: atomically replace files 1+2 with file 3.
+        let writer = {
+            let version = Arc::clone(&version);
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                for _ in 0..50 {
+                    // Forward: remove 1+2, add 3.
+                    {
+                        let mut guard = version.write().unwrap();
+                        let mut new_v = (**guard).clone();
+                        new_v.apply(&VersionEdit::RemoveFile { level: 1, file_id: 1 });
+                        new_v.apply(&VersionEdit::RemoveFile { level: 1, file_id: 2 });
+                        new_v.apply(&add(3, 1, "apple", "mango"));
+                        *guard = Arc::new(new_v);
+                    }
+                    // Reverse: remove 3, restore 1+2.
+                    {
+                        let mut guard = version.write().unwrap();
+                        let mut new_v = (**guard).clone();
+                        new_v.apply(&VersionEdit::RemoveFile { level: 1, file_id: 3 });
+                        new_v.apply(&add(1, 1, "apple", "fig"));
+                        new_v.apply(&add(2, 1, "grape", "mango"));
+                        *guard = Arc::new(new_v);
+                    }
+                }
+            })
+        };
+
+        writer.join().unwrap();
+        for h in reader_handles { h.join().unwrap(); }
+
+        assert!(
+            !any_partial.load(std::sync::atomic::Ordering::Relaxed),
+            "A reader observed a partial compaction state"
+        );
+    }
 }
