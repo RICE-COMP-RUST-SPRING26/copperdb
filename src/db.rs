@@ -1,12 +1,13 @@
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Mutex, RwLock, Arc};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 
 use crate::core::Record;
 use crate::memtable::state::MemTableState;
 use crate::wal::{Crc32Checksum, Wal, WalOpType, recover_all};
+use crate::manifest::{Manifest, VersionEdit, VersionState};
 
 const MAX_MEMTABLE_SIZE: usize = 64 * 1024 * 1024;
 const MAX_IMMUTABLE_TABLES: usize = 4;
@@ -17,6 +18,14 @@ const MAX_IMMUTABLE_TABLES: usize = 4;
 /// Read path:  MemTableState (active first, then immutables in reverse order).
 /// Recovery:   replay all unflushed WAL files on `open`.
 pub struct LsmEngine {
+    state: MemTableState,
+    active_wal: Mutex<Wal<Crc32Checksum>>,
+    next_seq: AtomicU64,
+    next_wal_gen: AtomicU64,
+    data_dir: PathBuf,
+    manifest: Mutex<Manifest>,
+    version: RwLock<Arc<VersionState>>,
+    next_sst_id: AtomicU64,
     pub(crate) state:    MemTableState,
     active_wal:          Mutex<Wal<Crc32Checksum>>,
     next_seq:            AtomicU64,
@@ -60,17 +69,20 @@ impl LsmEngine {
 
         let active_wal = Wal::<Crc32Checksum>::create(dir, next_gen)?;
 
-        // Recover next_sst_id by scanning for existing .sst files.
-        let next_sst_id = highest_sst_id(dir) + 1;
+        let (manifest, version_state) = Manifest::open_or_create(dir)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let next_sst_id = version_state.all_file_ids().max().unwrap_or(0) + 1;
 
-        let (flush_tx, flush_rx) = std::sync::mpsc::channel::<()>();
-
-        let engine = Arc::new(Self {
+        Ok(Self {
             state,
             active_wal: Mutex::new(active_wal),
             next_seq: AtomicU64::new(max_seq + 1),
             next_wal_gen: AtomicU64::new(next_gen + 1),
             data_dir: dir.to_path_buf(),
+            manifest: Mutex::new(manifest),
+            version: RwLock::new(Arc::new(version_state)),
+            next_sst_id: AtomicU64::new(next_sst_id),
+        })
             next_sst_id: AtomicU64::new(next_sst_id),
             flush_tx,
         });
@@ -128,7 +140,7 @@ impl LsmEngine {
         Ok(())
     }
 
-    /// Claim a unique SSTable file ID. Called by the flusher before writing.
+    /// Claim a unique SSTable file ID. Called by the flusher before writing a new .sst file.
     pub fn alloc_sst_id(&self) -> u64 {
         self.next_sst_id.fetch_add(1, Ordering::SeqCst)
     }
