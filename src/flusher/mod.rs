@@ -56,9 +56,15 @@ fn flush_pending(engine: &std::sync::Arc<LsmEngine>) {
             return;
         }
 
-        // TODO: record (file_id, key_range) in the Manifest once the versioning
-        // branch is merged. builder.key_range() provides the bounds.
-        let _ = builder.key_range();
+        let Some((smallest_key, largest_key)) = builder.key_range() else {
+            eprintln!("[flusher] SSTable {:?} has no keys after build; skipping", path);
+            return;
+        };
+
+        if let Err(e) = engine.record_flush(file_id, smallest_key, largest_key) {
+            eprintln!("[flusher] failed to record flush in manifest for {:?}: {}", path, e);
+            return;
+        }
 
         engine.state.drop_immutable(&table);
 
