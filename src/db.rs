@@ -18,19 +18,13 @@ const MAX_IMMUTABLE_TABLES: usize = 4;
 /// Read path:  MemTableState (active first, then immutables in reverse order).
 /// Recovery:   replay all unflushed WAL files on `open`.
 pub struct LsmEngine {
-    state: MemTableState,
-    active_wal: Mutex<Wal<Crc32Checksum>>,
-    next_seq: AtomicU64,
-    next_wal_gen: AtomicU64,
-    data_dir: PathBuf,
-    manifest: Mutex<Manifest>,
-    version: RwLock<Arc<VersionState>>,
-    next_sst_id: AtomicU64,
     pub(crate) state:    MemTableState,
     active_wal:          Mutex<Wal<Crc32Checksum>>,
     next_seq:            AtomicU64,
     next_wal_gen:        AtomicU64,
     pub(crate) data_dir: PathBuf,
+    manifest:            Mutex<Manifest>,
+    version:             RwLock<Arc<VersionState>>,
     next_sst_id:         AtomicU64,
     flush_tx:            Sender<()>,
 }
@@ -73,17 +67,17 @@ impl LsmEngine {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let next_sst_id = version_state.all_file_ids().max().unwrap_or(0) + 1;
 
-        Ok(Self {
+        let (flush_tx, flush_rx) = std::sync::mpsc::channel::<()>();
+
+        let engine = Arc::new(Self {
             state,
-            active_wal: Mutex::new(active_wal),
-            next_seq: AtomicU64::new(max_seq + 1),
+            active_wal:   Mutex::new(active_wal),
+            next_seq:     AtomicU64::new(max_seq + 1),
             next_wal_gen: AtomicU64::new(next_gen + 1),
-            data_dir: dir.to_path_buf(),
-            manifest: Mutex::new(manifest),
-            version: RwLock::new(Arc::new(version_state)),
-            next_sst_id: AtomicU64::new(next_sst_id),
-        })
-            next_sst_id: AtomicU64::new(next_sst_id),
+            data_dir:     dir.to_path_buf(),
+            manifest:     Mutex::new(manifest),
+            version:      RwLock::new(Arc::new(version_state)),
+            next_sst_id:  AtomicU64::new(next_sst_id),
             flush_tx,
         });
 
@@ -145,6 +139,73 @@ impl LsmEngine {
         self.next_sst_id.fetch_add(1, Ordering::SeqCst)
     }
 
+    /// Expose a read snapshot of the current version for the flusher and
+    /// compaction worker. Callers get an Arc clone without holding the lock.
+    pub fn current_version(&self) -> Arc<VersionState> {
+        Arc::clone(&self.version.read().unwrap())
+    }
+
+    /// Called by the flusher after successfully writing an SSTable file.
+    /// Persists the version edit to disk first, then atomically updates the
+    /// in-memory VersionState via CoW.
+    pub fn record_flush(
+        &self,
+        file_id: u64,
+        smallest_key: String,
+        largest_key: String,
+    ) -> io::Result<()> {
+        let edit = VersionEdit::AddFile { level: 0, file_id, smallest_key, largest_key };
+
+        self.manifest.lock().unwrap().append(&edit)?;
+
+        let mut guard = self.version.write().unwrap();
+        let mut new_version = (**guard).clone();
+        new_version.apply(&edit);
+        *guard = Arc::new(new_version);
+
+        Ok(())
+    }
+
+    /// Called by the compaction worker after merging files. Records all version
+    /// edits in one logical batch: removals of inputs, additions of outputs.
+    pub fn record_compaction(
+        &self,
+        removed: &[(u8, u64)],
+        added: &[(u8, u64, String, String)],
+    ) -> io::Result<()> {
+        let mut manifest = self.manifest.lock().unwrap();
+
+        for &(level, file_id) in removed {
+            manifest.append(&VersionEdit::RemoveFile { level, file_id })?;
+        }
+        for (level, file_id, smallest_key, largest_key) in added {
+            manifest.append(&VersionEdit::AddFile {
+                level:        *level,
+                file_id:      *file_id,
+                smallest_key: smallest_key.clone(),
+                largest_key:  largest_key.clone(),
+            })?;
+        }
+        drop(manifest);
+
+        let mut guard = self.version.write().unwrap();
+        let mut new_version = (**guard).clone();
+        for &(level, file_id) in removed {
+            new_version.apply(&VersionEdit::RemoveFile { level, file_id });
+        }
+        for (level, file_id, smallest_key, largest_key) in added {
+            new_version.apply(&VersionEdit::AddFile {
+                level:        *level,
+                file_id:      *file_id,
+                smallest_key: smallest_key.clone(),
+                largest_key:  largest_key.clone(),
+            });
+        }
+        *guard = Arc::new(new_version);
+
+        Ok(())
+    }
+
     fn rotate_wal_and_memtable(&self, expected_id: u64) -> io::Result<()> {
         let mut wal_guard = self.active_wal.lock().unwrap();
 
@@ -165,20 +226,12 @@ impl LsmEngine {
 }
 
 fn highest_wal_gen(dir: &Path) -> u64 {
-    highest_numeric_stem(dir, "wal")
-}
-
-fn highest_sst_id(dir: &Path) -> u64 {
-    highest_numeric_stem(dir, "sst")
-}
-
-fn highest_numeric_stem(dir: &Path, ext: &str) -> u64 {
     std::fs::read_dir(dir)
         .into_iter()
         .flatten()
         .filter_map(|e| {
             let path = e.ok()?.path();
-            if path.extension()?.to_str()? != ext {
+            if path.extension()?.to_str()? != "wal" {
                 return None;
             }
             path.file_stem()?.to_str()?.parse::<u64>().ok()

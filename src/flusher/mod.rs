@@ -38,7 +38,11 @@ fn flush_pending(engine: &std::sync::Arc<LsmEngine>) {
         let file_id = engine.alloc_sst_id();
         let path = sst_path(&engine.data_dir, file_id);
 
-        let mut builder = match SsTableBuilder::new(path.to_str().unwrap()) {
+        let Some(path_str) = path.to_str() else {
+            eprintln!("[flusher] SSTable path is not valid UTF-8: {:?}", path);
+            return;
+        };
+        let mut builder = match SsTableBuilder::new(path_str) {
             Ok(b) => b,
             Err(e) => {
                 eprintln!("[flusher] failed to create SSTable file {:?}: {}", path, e);
