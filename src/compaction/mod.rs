@@ -8,7 +8,7 @@ use std::sync::mpsc::Receiver;
 
 use crate::core::{InternalKey, KvIterator, Record};
 use crate::db::LsmEngine;
-use crate::version::{SstableMetadata, VersionState, sst_path};
+use crate::manifest::{SstableMetadata, VersionState, sst_path};
 use crate::sstable::block::Block;
 use crate::sstable::{FOOTER_SIZE, INDEX_OFFSET_SIZE, MAGIC_NUMBER};
 use crate::sstable::writer::SsTableBuilder;

@@ -143,16 +143,6 @@ impl SsTableBuilder {
         Ok(())
     }
 
-    /// Returns the inclusive key range `(smallest, largest)` of all entries
-    /// written to this SSTable, or `None` if the iterator was empty.
-    /// Must be called after `build_from_iterator`.
-    pub fn key_range(self) -> Option<(String, String)> {
-        match (self.smallest_key, self.largest_key) {
-            (Some(lo), Some(hi)) => Some((lo, hi)),
-            _ => None,
-        }
-    }
-
     /// Add a single entry to the SSTable. Flushes the current data block to
     /// disk when it is full and opens a fresh one. Call `finish_file` when done.
     pub fn add_entry(
