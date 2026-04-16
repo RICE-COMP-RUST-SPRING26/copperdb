@@ -2,7 +2,8 @@ use std::ops::Bound;
 use std::sync::Weak;
 use std::sync::mpsc::Receiver;
 
-use crate::db::{LsmEngine, sst_path};
+use crate::db::{LsmEngine};
+use crate::manifest::{sst_path};
 use crate::memtable::MemTable;
 use crate::sstable::writer::SsTableBuilder;
 use crate::wal::wal_path;

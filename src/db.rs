@@ -1,15 +1,13 @@
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::sync::{Mutex, RwLock, Arc};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 
 use crate::core::Record;
 use crate::memtable::state::MemTableState;
-use crate::version::{SharedVersion, VersionEdit, VersionState, sst_path};
 use crate::wal::{Crc32Checksum, Wal, WalOpType, recover_all};
-use crate::manifest::{Manifest, VersionEdit, VersionState};
+use crate::manifest::{Manifest, VersionEdit, VersionState, SharedVersion, sst_path};
 use crate::sstable::reader::SsTableReader;
 
 const MAX_MEMTABLE_SIZE: usize = 64 * 1024 * 1024;
@@ -30,15 +28,7 @@ pub struct LsmEngine {
     next_sst_id:         AtomicU64,
     compact_tx:          Sender<()>,
     manifest:            Mutex<Manifest>,
-    version:             RwLock<Arc<VersionState>>,
-    next_sst_id:         AtomicU64,
     flush_tx:            Sender<()>,
-}
-
-/// Returns the path for an SSTable file with the given ID.
-/// Zero-padded to 20 digits, matching the WAL naming convention.
-pub(crate) fn sst_path(dir: &Path, file_id: u64) -> PathBuf {
-    dir.join(format!("{:020}.sst", file_id))
 }
 
 impl LsmEngine {
@@ -88,17 +78,15 @@ impl LsmEngine {
             next_wal_gen: AtomicU64::new(next_gen + 1),
             data_dir:     dir.to_path_buf(),
             version:      SharedVersion::new(),
-            next_sst_id:  AtomicU64::new(1),
             compact_tx,
+            manifest:     Mutex::new(manifest),
+            next_sst_id:  AtomicU64::new(next_sst_id),
+            flush_tx,
         });
 
         let compaction_weak = Arc::downgrade(&engine);
         std::thread::spawn(move || crate::compaction::run(compaction_weak, compact_rx));
-            manifest:     Mutex::new(manifest),
-            version:      RwLock::new(Arc::new(version_state)),
-            next_sst_id:  AtomicU64::new(next_sst_id),
-            flush_tx,
-        });
+            
 
         // The flusher holds a Weak reference to avoid a cycle: if the engine Arc
         // is dropped, the Weak upgrade fails and the flusher exits cleanly.
@@ -223,27 +211,80 @@ impl LsmEngine {
     // Methods used by the compaction worker
     // -----------------------------------------------------------------------
 
-    /// Claim a unique SSTable file ID.
-    pub fn alloc_sst_id(&self) -> u64 {
-        self.next_sst_id.fetch_add(1, Ordering::SeqCst)
-    }
-
-    /// Snapshot of the current version for read-only use. Callers get an
-    /// `Arc` clone without holding any lock.
-    pub fn current_version(&self) -> Arc<VersionState> {
-        self.version.snapshot()
-    }
-
     /// Called by the compaction worker after writing new SSTable files.
     /// Atomically removes the input files and registers the outputs in the
     /// in-memory version state.
     ///
     /// NOTE: on this branch there is no manifest file; persistence comes from
     /// the flusher branch when the two are merged.
+    // pub fn record_compaction(
+    //     &self,
+    //     removed: &[(u8, u64)],
+    //     added:   &[(u8, u64, String, String)],
+    // ) -> io::Result<()> {
+    //     let mut edits: Vec<VersionEdit> = Vec::with_capacity(removed.len() + added.len());
+
+    //     for &(level, file_id) in removed {
+    //         edits.push(VersionEdit::RemoveFile { level, file_id });
+    //     }
+    //     for (level, file_id, smallest_key, largest_key) in added {
+    //         edits.push(VersionEdit::AddFile {
+    //             level:        *level,
+    //             file_id:      *file_id,
+    //             smallest_key: smallest_key.clone(),
+    //             largest_key:  largest_key.clone(),
+    //         });
+    //     }
+
+    //     self.version.apply(&edits);
+
+    //     // Wake the compaction worker again in case multiple levels are over
+    //     // threshold — one compaction per wakeup, so we need to keep firing.
+    //     self.compact_tx.send(()).ok();
+
+    //     Ok(())
+    // }
+
+    // -----------------------------------------------------------------------
+    // Internal helpers
+    // -----------------------------------------------------------------------
+
+    /// Claim a unique SSTable file ID. Called by the flusher before writing a new .sst file.
+    pub fn alloc_sst_id(&self) -> u64 {
+        self.next_sst_id.fetch_add(1, Ordering::SeqCst)
+    }
+
+    /// Expose a read snapshot of the current version for the flusher and
+    /// compaction worker. Callers get an Arc clone without holding the lock.
+    pub fn current_version(&self) -> Arc<VersionState> {
+        self.version.snapshot()
+    }
+
+    /// Called by the flusher after successfully writing an SSTable file.
+    /// Persists the version edit to disk first, then atomically updates the
+    /// in-memory VersionState via CoW.
+    pub fn record_flush(
+        &self,
+        file_id: u64,
+        smallest_key: String,
+        largest_key: String,
+    ) -> io::Result<()> {
+        let edit = VersionEdit::AddFile { level: 0, file_id, smallest_key, largest_key };
+
+        self.manifest.lock().unwrap().append(&edit)?;
+        self.version.apply(&[edit]);
+
+        self.compact_tx.send(()).ok();
+
+        Ok(())
+    }
+
+    /// Called by the compaction worker after merging files. Records all version
+    /// edits in one logical batch: removals of inputs, additions of outputs.
     pub fn record_compaction(
         &self,
         removed: &[(u8, u64)],
-        added:   &[(u8, u64, String, String)],
+        added: &[(u8, u64, String, String)],
     ) -> io::Result<()> {
         let mut edits: Vec<VersionEdit> = Vec::with_capacity(removed.len() + added.len());
 
@@ -259,6 +300,13 @@ impl LsmEngine {
             });
         }
 
+        {
+            let mut manifest = self.manifest.lock().unwrap();
+            for edit in &edits {
+                manifest.append(edit)?;
+            }
+        }
+
         self.version.apply(&edits);
 
         // Wake the compaction worker again in case multiple levels are over
@@ -268,113 +316,22 @@ impl LsmEngine {
         Ok(())
     }
 
-    // -----------------------------------------------------------------------
-    // Internal helpers
-    // -----------------------------------------------------------------------
-
-    fn rotate_wal_and_memtable(&self, expected_id: u64) -> io::Result<()> {
-        let mut wal_guard = self.active_wal.lock().unwrap();
-    /// Claim a unique SSTable file ID. Called by the flusher before writing a new .sst file.
-    pub fn alloc_sst_id(&self) -> u64 {
-        self.next_sst_id.fetch_add(1, Ordering::SeqCst)
-    }
-
-    /// Expose a read snapshot of the current version for the flusher and
-    /// compaction worker. Callers get an Arc clone without holding the lock.
-    pub fn current_version(&self) -> Arc<VersionState> {
-        Arc::clone(&self.version.read().unwrap())
-    }
-
-    /// Called by the flusher after successfully writing an SSTable file.
-    /// Persists the version edit to disk first, then atomically updates the
-    /// in-memory VersionState via CoW.
-    pub fn record_flush(
-        &self,
-        file_id: u64,
-        smallest_key: String,
-        largest_key: String,
-    ) -> io::Result<()> {
-        let edit = VersionEdit::AddFile { level: 0, file_id, smallest_key, largest_key };
-
-        self.manifest.lock().unwrap().append(&edit)?;
-
-        let mut guard = self.version.write().unwrap();
-        let mut new_version = (**guard).clone();
-        new_version.apply(&edit);
-        *guard = Arc::new(new_version);
-
-        Ok(())
-    }
-
-    /// Called by the compaction worker after merging files. Records all version
-    /// edits in one logical batch: removals of inputs, additions of outputs.
-    pub fn record_compaction(
-        &self,
-        removed: &[(u8, u64)],
-        added: &[(u8, u64, String, String)],
-    ) -> io::Result<()> {
-        let mut manifest = self.manifest.lock().unwrap();
-
-        for &(level, file_id) in removed {
-            manifest.append(&VersionEdit::RemoveFile { level, file_id })?;
-        }
-        for (level, file_id, smallest_key, largest_key) in added {
-            manifest.append(&VersionEdit::AddFile {
-                level:        *level,
-                file_id:      *file_id,
-                smallest_key: smallest_key.clone(),
-                largest_key:  largest_key.clone(),
-            })?;
-        }
-        drop(manifest);
-
-        let mut guard = self.version.write().unwrap();
-        let mut new_version = (**guard).clone();
-        for &(level, file_id) in removed {
-            new_version.apply(&VersionEdit::RemoveFile { level, file_id });
-        }
-        for (level, file_id, smallest_key, largest_key) in added {
-            new_version.apply(&VersionEdit::AddFile {
-                level:        *level,
-                file_id:      *file_id,
-                smallest_key: smallest_key.clone(),
-                largest_key:  largest_key.clone(),
-            });
-        }
-        *guard = Arc::new(new_version);
-
-        Ok(())
-    }
-
     fn rotate_wal_and_memtable(&self, expected_id: u64) -> io::Result<()> {
         let mut wal_guard = self.active_wal.lock().unwrap();
 
-        // 2. Identity-Based Double-Checked Locking!
+        // Identity-Based Double-Checked Locking:
         // If the active table's ID no longer matches the ID of the table we
         // filled up, it means another thread already rotated it. Abort safely!
         if self.state.active_id() != expected_id {
             return Ok(());
         }
+
         let new_wal_gen = self.next_wal_gen.fetch_add(1, Ordering::SeqCst);
         let new_wal = Wal::<Crc32Checksum>::create(&self.data_dir, new_wal_gen)?;
         self.state.freeze_active(new_wal_gen);
         *wal_guard = new_wal;
-        let new_wal = Wal::<Crc32Checksum>::create(&self.data_dir, new_wal_gen)?;
-
-        self.state.freeze_active(new_wal_gen);
-        *wal_guard = new_wal;
 
         self.flush_tx.send(()).ok();
-
-
-        // 3. Create the new WAL file
-        let new_wal = Wal::<Crc32Checksum>::create(&self.data_dir, new_wal_gen)?;
-
-        // 4. Freeze the MemTable and assign it the EXACT SAME ID
-        self.state.freeze_active(new_wal_gen);
-
-        // 5. Swap the active WAL
-        *wal_guard = new_wal;
 
         Ok(())
     }
