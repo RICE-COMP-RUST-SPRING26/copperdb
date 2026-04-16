@@ -9,6 +9,11 @@ pub mod writer;
 pub(crate) type IndexOffset = u64;
 pub(crate) type MagicNumber = u64;
 
+pub(crate) const MAGIC_NUMBER: MagicNumber = 0xDEADBEEFCAFEBABE;
+
+pub(crate) const INDEX_OFFSET_SIZE: usize = size_of::<IndexOffset>();
+pub(crate) const MAGIC_SIZE: usize = size_of::<MagicNumber>();
+pub(crate) const FOOTER_SIZE: usize = INDEX_OFFSET_SIZE + MAGIC_SIZE;
 pub(crate) const MAGIC_NUMBER: MagicNumber       = 0xDEADBEEFCAFEBABE;
 
 pub(crate) const INDEX_OFFSET_SIZE: usize = size_of::<IndexOffset>();
