@@ -315,6 +315,8 @@ fn highest_wal_gen(dir: &Path) -> u64 {
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
+    use std::sync::Arc;
+    use std::thread;
 
     fn tmp_dir() -> PathBuf {
         static COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -324,6 +326,8 @@ mod tests {
         std::fs::create_dir_all(&p).unwrap();
         p
     }
+
+    // --- existing tests ---
 
     #[test]
     fn put_and_get() {
@@ -388,5 +392,294 @@ mod tests {
 
         engine.put("k".into(), b"v2".to_vec()).unwrap();
         assert_eq!(engine.get("k"), Some(b"v2".to_vec()));
+    }
+
+    // --- get() ---
+
+    #[test]
+    fn get_returns_latest_value_after_overwrite() {
+        let dir = tmp_dir();
+        let engine = LsmEngine::open(&dir).unwrap();
+        engine.put("k".into(), b"v1".to_vec()).unwrap();
+        engine.put("k".into(), b"v2".to_vec()).unwrap();
+        engine.put("k".into(), b"v3".to_vec()).unwrap();
+        assert_eq!(engine.get("k"), Some(b"v3".to_vec()));
+    }
+
+    #[test]
+    fn get_returns_none_after_delete_and_reput_returns_new_value() {
+        let dir = tmp_dir();
+        let engine = LsmEngine::open(&dir).unwrap();
+        engine.put("k".into(), b"first".to_vec()).unwrap();
+        engine.delete("k".into()).unwrap();
+        assert_eq!(engine.get("k"), None, "tombstone should hide prior value");
+        engine.put("k".into(), b"second".to_vec()).unwrap();
+        assert_eq!(engine.get("k"), Some(b"second".to_vec()), "rewrite after delete");
+    }
+
+    #[test]
+    fn get_multiple_distinct_keys_do_not_collide() {
+        let dir = tmp_dir();
+        let engine = LsmEngine::open(&dir).unwrap();
+        for i in 0u32..50 {
+            engine.put(format!("key_{:04}", i), vec![i as u8]).unwrap();
+        }
+        for i in 0u32..50 {
+            assert_eq!(engine.get(&format!("key_{:04}", i)), Some(vec![i as u8]));
+        }
+    }
+
+    // After an active memtable is frozen into an immutable, get() must still
+    // find keys that lived only in the frozen table.
+    #[test]
+    fn get_finds_key_in_immutable_table_after_freeze() {
+        // Use a tiny memtable so the first big write forces a rotation.
+        let dir = tmp_dir();
+        let engine = LsmEngine::open_with_memtable_size(&dir, 128).unwrap();
+        engine.put("old".into(), b"value".to_vec()).unwrap();
+        // This large write should push the active table over 128 bytes and
+        // rotate it to the immutable queue.
+        engine.put("filler".into(), vec![0u8; 256]).unwrap();
+        // "old" is now in the immutable table; the active table holds "filler".
+        assert_eq!(engine.get("old"), Some(b"value".to_vec()));
+        assert!(engine.get("filler").is_some());
+    }
+
+    #[test]
+    fn get_tombstone_in_active_masks_value_in_immutable() {
+        let dir = tmp_dir();
+        let engine = LsmEngine::open_with_memtable_size(&dir, 128).unwrap();
+        engine.put("key".into(), b"alive".to_vec()).unwrap();
+        // Force a freeze so "key"="alive" lands in an immutable table.
+        engine.put("filler".into(), vec![0u8; 256]).unwrap();
+        // Write a tombstone for "key" into the new active table.
+        engine.delete("key".into()).unwrap();
+        // The tombstone in the active table must shadow the value in immutable.
+        assert_eq!(engine.get("key"), None);
+    }
+
+    // --- record_compaction() ---
+
+    #[test]
+    fn record_compaction_removes_inputs_and_registers_outputs() {
+        let dir = tmp_dir();
+        let engine = LsmEngine::open(&dir).unwrap();
+
+        // Seed two L0 files.
+        engine.record_compaction(
+            &[],
+            &[
+                (0, 1, "a".to_string(), "c".to_string()),
+                (0, 2, "d".to_string(), "f".to_string()),
+            ],
+        ).unwrap();
+        assert_eq!(engine.current_version().files_at_level(0).len(), 2);
+
+        // Compact L0 → L1.
+        engine.record_compaction(
+            &[(0, 1), (0, 2)],
+            &[(1, 3, "a".to_string(), "f".to_string())],
+        ).unwrap();
+
+        let v = engine.current_version();
+        assert_eq!(v.files_at_level(0).len(), 0, "L0 inputs must be removed");
+        assert_eq!(v.files_at_level(1).len(), 1, "L1 output must be registered");
+        assert_eq!(v.files_at_level(1)[0].file_id, 3);
+        assert_eq!(v.files_at_level(1)[0].smallest_key, "a");
+        assert_eq!(v.files_at_level(1)[0].largest_key, "f");
+    }
+
+    #[test]
+    fn record_compaction_remove_only_leaves_version_empty() {
+        let dir = tmp_dir();
+        let engine = LsmEngine::open(&dir).unwrap();
+
+        engine.record_compaction(&[], &[(0, 7, "x".to_string(), "z".to_string())]).unwrap();
+        assert_eq!(engine.current_version().files_at_level(0).len(), 1);
+
+        engine.record_compaction(&[(0, 7)], &[]).unwrap();
+        assert_eq!(engine.current_version().files_at_level(0).len(), 0);
+    }
+
+    #[test]
+    fn record_compaction_add_only_places_files_at_correct_level() {
+        let dir = tmp_dir();
+        let engine = LsmEngine::open(&dir).unwrap();
+
+        engine.record_compaction(
+            &[],
+            &[
+                (1, 10, "apple".to_string(), "mango".to_string()),
+                (1, 11, "orange".to_string(), "zebra".to_string()),
+            ],
+        ).unwrap();
+
+        let v = engine.current_version();
+        assert_eq!(v.files_at_level(1).len(), 2);
+        // L1 files are kept sorted by smallest_key.
+        assert_eq!(v.files_at_level(1)[0].file_id, 10);
+        assert_eq!(v.files_at_level(1)[1].file_id, 11);
+    }
+
+    #[test]
+    fn record_compaction_empty_call_is_noop() {
+        let dir = tmp_dir();
+        let engine = LsmEngine::open(&dir).unwrap();
+        engine.record_compaction(&[], &[]).unwrap();
+        let v = engine.current_version();
+        for level in 0..7 {
+            assert!(v.files_at_level(level).is_empty(), "level {} should be empty", level);
+        }
+    }
+
+    #[test]
+    fn record_compaction_removes_nonexistent_file_is_safe() {
+        let dir = tmp_dir();
+        let engine = LsmEngine::open(&dir).unwrap();
+        // Removing a file that was never registered must not panic or corrupt state.
+        engine.record_compaction(&[(0, 999)], &[]).unwrap();
+        assert!(engine.current_version().files_at_level(0).is_empty());
+    }
+
+    #[test]
+    fn record_compaction_spans_multiple_levels() {
+        let dir = tmp_dir();
+        let engine = LsmEngine::open(&dir).unwrap();
+
+        engine.record_compaction(
+            &[],
+            &[
+                (0, 1, "a".to_string(), "b".to_string()),
+                (1, 2, "c".to_string(), "d".to_string()),
+                (2, 3, "e".to_string(), "f".to_string()),
+            ],
+        ).unwrap();
+
+        // Compact L1 file into L2.
+        engine.record_compaction(
+            &[(1, 2)],
+            &[(2, 4, "c".to_string(), "f".to_string())],
+        ).unwrap();
+
+        let v = engine.current_version();
+        assert_eq!(v.files_at_level(0).len(), 1, "L0 untouched");
+        assert_eq!(v.files_at_level(1).len(), 0, "L1 input removed");
+        assert_eq!(v.files_at_level(2).len(), 2, "original L2 + new output");
+    }
+
+    // --- concurrency ---
+
+    // get() must never panic or return garbage while record_compaction() is
+    // concurrently replacing the version state.
+    #[test]
+    fn concurrent_get_and_record_compaction_no_panic() {
+        let dir = tmp_dir();
+        let engine = Arc::new(LsmEngine::open(&dir).unwrap());
+
+        // Pre-populate the memtable so get() has real data to return.
+        for i in 0u32..100 {
+            engine.put(format!("key_{:04}", i), vec![i as u8]).unwrap();
+        }
+
+        // Seed an initial file so the compaction thread has something to remove.
+        engine.record_compaction(
+            &[],
+            &[(0, 1000, "key_0000".to_string(), "key_0099".to_string())],
+        ).unwrap();
+
+        let e1 = Arc::clone(&engine);
+        let compactor = thread::spawn(move || {
+            for id in 0u64..200 {
+                // Alternate between adding and then removing the same file.
+                e1.record_compaction(
+                    &[(0, 1000)],
+                    &[(1, 2000 + id, "key_0000".to_string(), "key_0099".to_string())],
+                ).ok();
+                e1.record_compaction(
+                    &[(1, 2000 + id)],
+                    &[(0, 1000, "key_0000".to_string(), "key_0099".to_string())],
+                ).ok();
+            }
+        });
+
+        let e2 = Arc::clone(&engine);
+        let reader = thread::spawn(move || {
+            for _ in 0..1000 {
+                for i in 0u32..10 {
+                    let _ = e2.get(&format!("key_{:04}", i));
+                }
+            }
+        });
+
+        compactor.join().unwrap();
+        reader.join().unwrap();
+
+        // Memtable data must remain intact.
+        for i in 0u32..100 {
+            assert_eq!(engine.get(&format!("key_{:04}", i)), Some(vec![i as u8]));
+        }
+    }
+
+    // Concurrent puts, gets, and record_compaction calls must not deadlock or
+    // corrupt the version state.
+    #[test]
+    fn concurrent_put_get_and_record_compaction() {
+        let dir = tmp_dir();
+        let engine = Arc::new(LsmEngine::open(&dir).unwrap());
+        let mut handles = vec![];
+
+        // Writer threads.
+        for t in 0u32..4 {
+            let e = Arc::clone(&engine);
+            handles.push(thread::spawn(move || {
+                for i in 0u32..100 {
+                    e.put(format!("t{}k{:04}", t, i), vec![(t + i) as u8]).unwrap();
+                }
+            }));
+        }
+
+        // Reader threads.
+        for _ in 0..4 {
+            let e = Arc::clone(&engine);
+            handles.push(thread::spawn(move || {
+                for _ in 0..500 {
+                    let _ = e.get("t0k0000");
+                    let _ = e.get("nonexistent");
+                }
+            }));
+        }
+
+        // Version-mutation threads (simulating compaction results arriving).
+        for base in 0u64..4 {
+            let e = Arc::clone(&engine);
+            handles.push(thread::spawn(move || {
+                for offset in 0u64..20 {
+                    let file_id = base * 100 + offset;
+                    e.record_compaction(
+                        &[],
+                        &[(
+                            1,
+                            file_id,
+                            format!("k{:04}", offset),
+                            format!("k{:04}", offset + 9),
+                        )],
+                    ).unwrap();
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // Writes made by the writer threads must all be readable.
+        for t in 0u32..4 {
+            for i in 0u32..100 {
+                assert_eq!(
+                    engine.get(&format!("t{}k{:04}", t, i)),
+                    Some(vec![(t + i) as u8]),
+                );
+            }
+        }
     }
 }
