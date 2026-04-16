@@ -7,7 +7,7 @@ use bloomfilter::Bloom;
 use crate::core::{InternalKey, KvIterator, Record};
 use crate::sstable::block::BlockBuilder;
 use crate::sstable::{
-    FOOTER_SIZE, INDEX_OFFSET_SIZE, IndexOffset, MAGIC_NUMBER, MAGIC_SIZE, META_OFFSET_SIZE,
+    FOOTER_SIZE, INDEX_OFFSET_SIZE, IndexOffset, MAGIC_NUMBER, MAGIC_SIZE, MagicNumber, META_OFFSET_SIZE,
 };
 
 #[derive(thiserror::Error, Debug)]
@@ -45,6 +45,10 @@ pub struct SsTableBuilder {
     first_key_of_current_block: Option<String>,
     /// Bloom filter tracking every unique user_key added to this SSTable
     bloom: Bloom<String>,
+    /// First user_key written — set once on the first entry, never updated.
+    smallest_key: Option<String>,
+    /// Last user_key written — updated on every entry; holds the largest after build.
+    largest_key: Option<String>,
 }
 
 impl SsTableBuilder {
@@ -59,7 +63,19 @@ impl SsTableBuilder {
             current_offset: 0,
             first_key_of_current_block: None,
             bloom,
+            smallest_key: None,
+            largest_key: None,
         })
+    }
+
+    /// Returns the inclusive key range `(smallest, largest)` of all entries
+    /// written to this SSTable. Returns `None` if the iterator was empty.
+    /// Must be called after `build_from_iterator`.
+    pub fn key_range(self) -> Option<(String, String)> {
+        match (self.smallest_key, self.largest_key) {
+            (Some(lo), Some(hi)) => Some((lo, hi)),
+            _ => None,
+        }
     }
 
     /// Consumes a MemTable iterator, slicing it into 4KB blocks and writing to disk.
@@ -90,6 +106,12 @@ impl SsTableBuilder {
 
             // Track every user_key in the bloom filter
             self.bloom.set(&user_key);
+
+            // Track key range across the whole file
+            if self.smallest_key.is_none() {
+                self.smallest_key = Some(user_key.clone());
+            }
+            self.largest_key = Some(user_key.clone());
 
             // If this is the first entry in a block, save it for the index
             if self.first_key_of_current_block.is_none() {
@@ -146,6 +168,99 @@ impl SsTableBuilder {
         self.file.sync_all()?;
 
         Ok(())
+    }
+
+    /// Returns the inclusive key range `(smallest, largest)` of all entries
+    /// written to this SSTable, or `None` if the iterator was empty.
+    /// Must be called after `build_from_iterator`.
+    pub fn key_range(self) -> Option<(String, String)> {
+        match (self.smallest_key, self.largest_key) {
+            (Some(lo), Some(hi)) => Some((lo, hi)),
+            _ => None,
+        }
+    }
+
+    /// Add a single entry to the SSTable. Flushes the current data block to
+    /// disk when it is full and opens a fresh one. Call `finish_file` when done.
+    pub fn add_entry(
+        &mut self,
+        user_key: &str,
+        record: &Record,
+        seq_num: u64,
+    ) -> Result<(), WriterError> {
+        let internal_key = InternalKey {
+            user_key: user_key.to_string(),
+            seq_num,
+        };
+
+        if !self.current_block.add(&internal_key, record) {
+            self.finish_current_block()?;
+            if !self.current_block.add(&internal_key, record) {
+                return Err(WriterError::InvalidData(
+                    "A single key-value pair exceeds TARGET_BLOCK_SIZE".to_string(),
+                ));
+            }
+        }
+
+        if self.smallest_key.is_none() {
+            self.smallest_key = Some(user_key.to_string());
+        }
+        self.largest_key = Some(user_key.to_string());
+
+        if self.first_key_of_current_block.is_none() {
+            self.first_key_of_current_block = Some(user_key.to_string());
+        }
+
+        Ok(())
+    }
+
+    /// Bytes committed to disk so far, not counting data still buffered in the
+    /// current unflushed block. Used by the compaction worker to decide when to
+    /// roll over to a new output file.
+    pub fn current_size(&self) -> u64 {
+        self.current_offset
+    }
+
+    /// Flush remaining buffered data, write the index block and footer, then
+    /// sync. Returns `Some((smallest_key, largest_key))` if any entries were
+    /// written, or `None` for an empty file.
+    pub fn finish_file(mut self) -> Result<Option<(String, String)>, WriterError> {
+        if !self.current_block.is_empty() {
+            self.finish_current_block()?;
+        }
+
+        let mut index_block = BlockBuilder::new();
+        for (first_key, offset) in &self.block_index {
+            let index_key = InternalKey {
+                user_key: first_key.clone(),
+                seq_num: 0,
+            };
+            let index_record = Record::Put(offset.to_be_bytes().to_vec());
+            if !index_block.add(&index_key, &index_record) {
+                return Err(WriterError::InvalidData(
+                    "Index block exceeded TARGET_BLOCK_SIZE; multi-level index required"
+                        .to_string(),
+                ));
+            }
+        }
+
+        let index_data = index_block.build();
+        let index_offset = self.current_offset;
+
+        self.file.write_all(&index_data)?;
+
+        let mut footer = [0u8; FOOTER_SIZE];
+        let index_end = INDEX_OFFSET_SIZE;
+        let magic_end = index_end + MAGIC_SIZE;
+        footer[0..index_end].copy_from_slice(&index_offset.to_be_bytes());
+        footer[index_end..magic_end].copy_from_slice(&MAGIC_NUMBER.to_be_bytes());
+        self.file.write_all(&footer)?;
+        self.file.sync_all()?;
+
+        Ok(match (self.smallest_key, self.largest_key) {
+            (Some(lo), Some(hi)) => Some((lo, hi)),
+            _ => None,
+        })
     }
 
     /// Helper to write the current block to disk and record its location in the index.
@@ -257,13 +372,13 @@ mod tests {
         let len = data.len();
         let footer_start = len - FOOTER_SIZE;
 
-        let meta_offset = u64::from_be_bytes(
+        let meta_offset = MetaOffset::from_be_bytes(
             data[footer_start..footer_start + META_OFFSET_SIZE]
                 .try_into()
                 .unwrap(),
         ) as usize;
 
-        let index_offset = u64::from_be_bytes(
+        let index_offset = IndexOffset::from_be_bytes(
             data[footer_start + META_OFFSET_SIZE..footer_start + META_OFFSET_SIZE + INDEX_OFFSET_SIZE]
                 .try_into()
                 .unwrap(),
@@ -308,9 +423,9 @@ mod tests {
 
         let len = data.len();
         let magic_start = len - MAGIC_SIZE;
-        let magic = u64::from_be_bytes(data[magic_start..len].try_into().unwrap());
+        let magic = MagicNumber::from_be_bytes(data[magic_start..len].try_into().unwrap());
         assert_eq!(
-            magic, 0xDEADBEEFCAFEBABEu64,
+            magic, MAGIC_NUMBER,
             "Footer magic number is missing/corrupted"
         );
 

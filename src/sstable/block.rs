@@ -270,6 +270,19 @@ impl Block {
         Ok((InternalKey { user_key, seq_num }, record))
     }
 
+    /// Decode every entry in the block in storage order and return them as an
+    /// owned `Vec`. Used by `SsTableIterator` for full-scan reads during
+    /// compaction.
+    pub fn iter_all(&self) -> Result<Vec<(InternalKey, Record)>, BlockError> {
+        let n = self.get_num_offsets()?;
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            let offset = self.get_offset(i, n)?;
+            out.push(self.decode_entry(offset)?);
+        }
+        Ok(out)
+    }
+
     // --- The Core Search ---
 
     /// Binary-searches the block for `target_key` and returns the newest
