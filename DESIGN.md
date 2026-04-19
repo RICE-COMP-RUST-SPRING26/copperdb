@@ -186,7 +186,7 @@ Lock-free concurrent skip list (`crossbeam-skiplist`) serving as the in-memory w
 ### Configuration
 
 - Active MemTable size limit: **64 MB**
-- Max immutable MemTables in RAM: **4** (backpressure stalls writes if exceeded)
+- Max immutable MemTables in RAM: **4** (backpressure stalls writes if exceeded — see Write Backpressure)
 
 ---
 
@@ -241,8 +241,53 @@ When a freeze occurs, `rotate_wal` increments `next_wal_gen`, creates a new WAL 
 ### Known Limitations
 
 - **WAL–MemTable pairing race:** See WAL Known Limitations. The engine inherits this issue — it is a Phase 2 concern.
-- **Backpressure not wired:** `MemTableState::is_flush_falling_behind` is never checked. Writes are not stalled when immutable MemTables accumulate past the limit of 4. This is intentional until the background flusher exists in Phase 2.
 - **WAL not fsynced:** Writes survive process crashes but not power loss. Calling `Wal::sync()` after each append would provide stronger guarantees at the cost of one fsync per write.
+
+---
+
+## Feature: Write Backpressure
+
+> **Owner: Fernando (Partner B)**
+> **Modules: `memtable/state.rs`, `db.rs`**
+> **Status: IMPLEMENTED**
+
+### Purpose
+
+When the background flusher cannot keep up with incoming writes, frozen (immutable) MemTables accumulate in RAM. Without backpressure, the immutable queue grows without bound, eventually exhausting memory. Write backpressure stalls writers when the queue reaches its configured limit (`MAX_IMMUTABLE_TABLES = 4`), giving the flusher time to drain.
+
+### Mechanism
+
+The backpressure system uses a `Condvar` to coordinate writers and the flusher without busy-waiting:
+
+1. **Check:** Before every MemTable insert, `put()` and `delete()` call `wait_for_flush_capacity()`. A fast-path check of `is_flush_falling_behind()` avoids any locking when the queue is not full.
+2. **Stall:** If the immutable queue has >= `MAX_IMMUTABLE_TABLES` entries, the writer blocks on the `Condvar` via `wait_timeout_while`. The timeout (`BACKPRESSURE_TIMEOUT = 5s`) prevents permanent hangs if the flusher dies.
+3. **Wake:** After each successful `drop_immutable()`, `MemTableState` calls `notify_all()` on the `Condvar`, waking all stalled writers. They re-check the predicate — if the queue is still full, they go back to sleep.
+4. **Error:** If the timeout expires while still stalled, the write returns `io::ErrorKind::TimedOut`.
+
+### Key Structures
+
+- **`MemTableState::flush_cond`** — A `(Mutex<()>, Condvar)` pair. The `Mutex` exists only to satisfy `Condvar`'s API; the actual predicate is checked via `is_flush_falling_behind()` which reads the `RwLock<Arc<InnerState>>` independently.
+- **`MemTableState::wait_if_stalled(timeout)`** — Blocks the caller until the queue drops below threshold or the timeout expires. Returns `true` if the wait completed normally, `false` on timeout.
+- **`LsmEngine::wait_for_flush_capacity()`** — Thin wrapper that maps a timeout to `io::Error`.
+
+### Placement in the Write Path
+
+```
+put()/delete()
+  │
+  ├─ 1. Claim sequence number (AtomicU64)
+  ├─ 2. WAL append (under Mutex)
+  ├─ 3. wait_for_flush_capacity()  ◄── BACKPRESSURE CHECK
+  ├─ 4. MemTable insert (lock-free)
+  └─ 5. Rotate WAL + freeze if threshold crossed
+```
+
+Backpressure is checked *after* the WAL append so that the record is durable before stalling. If a crash occurs while the writer is blocked, recovery replays the WAL record normally.
+
+### Configuration
+
+- `MAX_IMMUTABLE_TABLES`: **4** — queue depth before stalling
+- `BACKPRESSURE_TIMEOUT`: **5 seconds** — maximum time a write will block
 
 ---
 
