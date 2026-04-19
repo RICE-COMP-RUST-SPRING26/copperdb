@@ -11,7 +11,6 @@ bloomfilter = "3.0.1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
 axum = "0.8"
 async-trait = "0.1"
-bytes = "1"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
