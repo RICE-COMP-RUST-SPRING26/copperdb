@@ -115,16 +115,20 @@ impl LsmEngine {
     /// an error if the flusher cannot drain the queue within the timeout.
     pub fn put(&self, key: String, value: Vec<u8>) -> io::Result<()> {
         let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
-        {
+        if let Some(expected_id) = {
             let mut wal = self.active_wal.lock().unwrap();
             wal.append_put(seq, &key, &value)?;
-        }
 
-        self.wait_for_flush_capacity()?;
+            // OK to wait for flush while holding active_wal since we don't want writes to
+            // happen anyway.
+            self.wait_for_flush_capacity()?;
 
-        if let Some(expected_id) = self.state.put(key, Record::Put(value), seq) {
+            // Keep lock on active_wal so a different thread doesn't freeze the active MemTable.
+            self.state.put(key, Record::Put(value), seq)
+        } {
             self.rotate_wal_and_memtable(expected_id)?;
         }
+
         Ok(())
     }
 
